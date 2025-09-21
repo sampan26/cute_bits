@@ -3,7 +3,8 @@
 
 #include <torch/extension.h>
 #include <torch/python.h>
-
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_bf16.h>
 #include <cute/tensor.hpp>
 
 #define CHECK_CUDA(x)                                                          \
@@ -12,30 +13,35 @@
   TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x)                                                         \
   CHECK_CUDA(x);                                                               \
-  CHECK_CONTIGUOUS(x)                                                           \
+  CHECK_CONTIGUOUS(x)
                       
-void run_gemm(void *A, void *B, void *C, int BA, int BB, int M, int N, int K, cudaStream_t stream);
+// Template declaration for the function in matmul.cu
+template<class TA, class TB, class TC>
+void run_fp8_gemm(TA const *A, TB const *B, TC *C, int m, int n, int k, cudaStream_t stream);
 
 
 torch::Tensor cutlass_matmul(torch::Tensor a, torch::Tensor b){
     CHECK_INPUT(a);
     CHECK_INPUT(b);
 
-    int m, n, k;
-
-    // batch size
-    int a_ndim = a.sizes().size();
-    int b_ndim = b.sizes().size();
-
-    m, k = a.size();
-    n, k = b.size();
+    // Get tensor dimensions properly
+    int m = a.size(0);
+    int k = a.size(1);
+    int n = b.size(1);
     
     at::cuda::CUDAGuard device_guard{(char)a.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto opts = a.options();
 
-    auto out = torch::empty({batch, m, n}, opts.dtype(kBfloat16));
-    run_gemm(a.data_ptr(), b.data_ptr(), out.data_ptr(), m, n, k, stream);
+    // Create output tensor with proper dimensions (no batch dimension for 2D matmul)
+    auto out = torch::empty({m, n}, opts.dtype(torch::kBFloat16));
+    
+    // Call the templated function with proper type casting
+    run_fp8_gemm(
+        reinterpret_cast<nv_bfloat16 const*>(a.data_ptr<at::BFloat16>()), 
+        reinterpret_cast<nv_bfloat16 const*>(b.data_ptr<at::BFloat16>()), 
+        reinterpret_cast<nv_bfloat16*>(out.data_ptr<at::BFloat16>()), 
+        m, n, k, stream);
     
     return out;
 }
