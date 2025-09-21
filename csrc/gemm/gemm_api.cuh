@@ -28,14 +28,14 @@ torch::Tensor cutlass_matmul(torch::Tensor a, torch::Tensor b){
     int b_ndim = b.sizes().size();
 
     m, k = a.size();
-    _, n = b.size();
+    n, k = b.size();
     
     at::cuda::CUDAGuard device_guard{(char)a.get_device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto opts = a.options();
 
     auto out = torch::empty({batch, m, n}, opts.dtype(kBfloat16));
-    run_gemm(a.data_ptr(), b.data_ptr(), out.data_ptr(), bs_a, bs_b, m, n, k, stream);
+    run_gemm(a.data_ptr(), b.data_ptr(), out.data_ptr(), m, n, k, stream);
     
     return out;
 }
