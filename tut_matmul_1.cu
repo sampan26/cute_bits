@@ -22,8 +22,8 @@ struct SharedStorage
     alignas(128) cute::ArrayEngine<ElementB, cosize_v<SmemLayoutB>> B;
 
     uint64_t tma_barrier[size<2>(SmemLayoutA{})];
-    uint64_t mma_barrier[size<2>(SmemLayoutB{})];   
-}
+    uint64_t mma_barrier[size<2>(SmemLayoutA{})];   
+};
 
 
 template <class ProblemShape, class CtaTiler,
@@ -45,7 +45,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     Tensor mB = tma_b.get_tma_tensor(make_shape(N, K));
     Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N));
 
-    auto cta_coord = make_coords(blockIdx.x, blockIdx.y, _);
+    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
     Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
     Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
@@ -62,14 +62,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
                                         group_mode<0,2>(sB), group_mode<0,2>(gB));
     
-    const int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
-                                      + sizeof(make_tensor_like(tesnor<0>(tBsB));
+    constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
+                                      + sizeof(make_tensor_like(tesnor<0>(tBsB)));
     auto K_PIPE_MAX = size<1>(tAsA);
     int k_tile_count = size<1>(tAgA);
     int k_tile = 0;
     
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    int lane_predicate = cute:select_one_sync();
+    int lane_predicate = cute::select_one_sync();
     uint64_t* producer_mbar = smem.tma_barrier;
     uint64_t* consumer_mbar = smem.mma_barrier;
 
@@ -88,8 +88,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     for (int pipe=0; pipe < K_PIPE_MAX; ++pipe) {
         if ((warp_idx==0) && lane_predicate) {
             ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-            copy(tma_a.with(producer_mbar[pipe], tAgA(_, k_tile), tAsA(_, pipe)));
-            copy(tma_b.with(producer_mbar[pipe], tBgB(_, k_tile), tAsB(_, pipe)));
+            copy(tma_a.with(producer_mbar[pipe]), tAgA(_, k_tile), tAsA(_, pipe));
+            copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tBsB(_, pipe));
         }
         ++k_tile;
         --k_tile_count;
@@ -103,8 +103,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     Tensor tCrC = thr_mma.make_fragment_C(tCgC);
     clear(tCrC);
 
-    Tnesor tCrA = thr_mma.make_fragment_A(tCsA);
-    Tnesor tCrB = thr_mma.make_fragment_B(tCsB);
+    Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+    Tensor tCrB = thr_mma.make_fragment_B(tCsB);
 
     auto write_state = cutlass::PipelineState<K_PIPE_MAX>();
     auto read_state = cutlass::PipelineState<K_PIPE_MAX>();
@@ -116,8 +116,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
 
         warpgroup_arrive();
-        gemm(mma, tCsA(_, _, read_pipe), tCsB(_, _, read_pipe), tCrC);
-        warpgroup_commit();
+        gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_, _,_,read_pipe), tCrC);
+        warpgroup_commit_batch();
         warpgroup_wait<0>();
 
         ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
@@ -129,8 +129,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
 
             ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-            copy(tma_a.with(producer_mbar[pipe], tAgA(_, k_tile), tAsA(_, pipe)));
-            copy(tma_b.with(producer_mbar[pipe], tBgB(_, k_tile), tAsB(_, pipe)));
+            copy(tma_a.with(producer_mbar[pipe]), tAgA(_, k_tile), tAsA(_, pipe));
+            copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tAsB(_, pipe));
             ++write_state;
         }
         --k_tile_count;
@@ -155,9 +155,9 @@ void gemm_nt(int m, int n, int k,
     auto K = int(k);
     auto prob_shape = make_shape(M, N, K);
 
-    auto dA = make_shape(Int<1>{}, ldA);
-    auto dB = make_shape(Int<1>{}, ldB);
-    auto dC = make_shape(Int<1>{}, ldC);
+    auto dA = make_stride(Int<1>{}, ldA);
+    auto dB = make_stride(Int<1>{}, ldB);
+    auto dC = make_stride(Int<1>{}, ldC);
 
     auto bM = Int<128>{};
     auto bN = Int<128>{};
@@ -168,11 +168,11 @@ void gemm_nt(int m, int n, int k,
     auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN, bK, bP));
 
-    Tensor mA = make_tensor(A, make_shape(M, K), ldA);
-    Tensor mB = make_tensor(B, make_shape(N, K), ldB);
+    Tensor mA = make_tensor(A, make_shape(M, K), dA);
+    Tensor mB = make_tensor(B, make_shape(N, K), dB);
 
-    auto tma_a = make_tma_copy(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
-    auto tma_b = make_tma_copy(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
+    Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
+    Copy_Atom tma_b = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
@@ -213,9 +213,9 @@ void gemm_tn(int m, int n, int k,
     auto K = int(k);
     auto prob_shape = make_shape(M, N, K);
 
-    auto dA = make_shape(ldA, Int<1>{});
-    auto dB = make_shape(ldB, Int<1>{});
-    auto dC = make_shape(Int<1>{}, ldC);
+    auto dA = make_stride(ldA, Int<1>{});
+    auto dB = make_stride(ldB, Int<1>{});
+    auto dC = make_stride(Int<1>{}, ldC);
 
     auto bM = Int<128>{};
     auto bN = Int<128>{};
@@ -226,11 +226,11 @@ void gemm_tn(int m, int n, int k,
     auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN, bK, bP));
 
-    Tensor mA = make_tensor(A, make_shape(M, K), ldA);
-    Tensor mB = make_tensor(B, make_shape(N, K), ldB);
+    Tensor mA = make_tensor(A, make_shape(M, K), dA);
+    Tensor mB = make_tensor(B, make_shape(N, K), dB);
 
-    auto tma_a = make_tma_copy(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
-    auto tma_b = make_tma_copy(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
+    Copy_Atom tma_a = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
+    Copy_Atom tma_b = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
@@ -240,13 +240,14 @@ void gemm_tn(int m, int n, int k,
     // dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
     //            round_up(size(ceil_div(n, bN)), dimCluster.y));
     int smem_bytes = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
-    auto* kernel_ptr = &gemm_devicedecltype<(prob_shape), decltype(cta_tiler),
-                                            TA, decltype(sA), decltype(tmaA),
-                                            TB, decltype(sB), decltype(tmaB),
-                                            TC, decltype(dC), decltype(tiled_mma),
-                                            decltype(alpha), decltype(beta)>;
+    void const* kernel_ptr = reinterpret_cast<void const*>(
+                            &gemm_device<decltype(prob_shape), decltype(cta_tiler),
+                                         TA, decltype(sA), decltype(tmaA),
+                                         TB, decltype(sB), decltype(tmaB),
+                                         TC, decltype(dC), decltype(tiled_mma),
+                                         decltype(alpha), decltype(beta)>);
     cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
-    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, (void const*) kernel_ptr,
+    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
                                                                 prob_shape, cta_tiler,
                                                                 A, tmaA,
                                                                 B, tmaB,
@@ -266,7 +267,7 @@ void gemm(char transA, char transB, int m, int n, int k,
     TC * C, int ldC,
     cudaStream_t stream = 0)
 {
-    if (transA == "T" && transB == "N") {
+    if (transA == 'T' && transB == 'N') {
         return gemm_tn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
     }
     else if (transA == 'N' && transB == 'T') {
@@ -282,13 +283,14 @@ int main(int argc, char** argv) {
     int n = 4096;
     if (argc >= 3)
         sscanf(argv[2], "%d", &n);
+    int k = 4096;
     if (argc >= 4)
         sscanf(argv[3], "%d", &k);
 
-    char transA = "T";
+    char transA = 'T';
     if (argc >= 5)
         sscanf(argv[4], "%c", &transA);
-    char transB = "N";
+    char transB = 'N';
     if (argc >= 6)
         sscanf(argv[5], "%c", &transB);
 
@@ -298,28 +300,28 @@ int main(int argc, char** argv) {
     using TI = cute::half_t;
 
     TI alpha = TI(1.0f);
-    TI beta = TI(1.0f);
+    TI beta = TI(1.0f.0f);
 
     thrust::host_vector<TA> h_A(m*k);
     thrust::host_vector<TB> h_B(n*k);
     thrust::host_vector<TC> h_C(m*n);
 
     for (int j = 0; j < m*k; ++j) h_A[j] = TA(int((rand() % 2) ? 1 : -1));
-    for (int j = 0; j < m*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
-    for (int j = 0; j < m*k; ++j) h_C[j] = TC(0);
+    for (int j = 0; j < n*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < m*n; ++j) h_C[j] = TC(0);
 
     thrust::device_vector<TA> d_A = h_A;
-    thrust::device_vector<TA> d_B = h_B;
-    thrust::device_vector<TA> d_C = h_C;
+    thrust::device_vector<TB> d_B = h_B;
+    thrust::device_vector<TC> d_C = h_C;
 
     int ldA = 0, ldB = 0, ldC = m;
-    if (transA == "T") {
+    if (transA == 'T') {
         ldA = k;
     }
     else {
         ldA = m;
     }
-    if (transB == "N") {
+    if (transB == 'N') {
         ldB = k;
     }
     else {
