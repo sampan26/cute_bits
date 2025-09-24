@@ -10,6 +10,7 @@
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
+
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
 
@@ -58,18 +59,18 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
 
     auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
-                                       group_mode<0,2>(sA), group_mode<0,2>(gA));
+                                       group_modes<0,2>(sA), group_modes<0,2>(gA));
     auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
-                                        group_mode<0,2>(sB), group_mode<0,2>(gB));
+                                        group_modes<0,2>(sB), group_modes<0,2>(gB));
     
     constexpr int tma_transaction_bytes = sizeof(make_tensor_like(tensor<0>(tAsA)))
-                                      + sizeof(make_tensor_like(tesnor<0>(tBsB)));
+                                      + sizeof(make_tensor_like(tensor<0>(tBsB)));
     auto K_PIPE_MAX = size<1>(tAsA);
     int k_tile_count = size<1>(tAgA);
     int k_tile = 0;
     
     int warp_idx = cutlass::canonical_warp_idx_sync();
-    int lane_predicate = cute::select_one_sync();
+    int lane_predicate = cute::elect_one_sync();
     uint64_t* producer_mbar = smem.tma_barrier;
     uint64_t* consumer_mbar = smem.mma_barrier;
 
@@ -130,7 +131,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 
             ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
             copy(tma_a.with(producer_mbar[pipe]), tAgA(_, k_tile), tAsA(_, pipe));
-            copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tAsB(_, pipe));
+            copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tBsB(_, pipe));
             ++write_state;
         }
         --k_tile_count;
@@ -172,28 +173,32 @@ void gemm_nt(int m, int n, int k,
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
 
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
-    Copy_Atom tma_b = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
+    Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
-    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
+    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
 
     dim3 dimBlock(size(tiled_mma));
-    dim3 dimGrid(ceil_div(M, bM), ceil_div(N, bN));
     dim3 dimCluster(2, 1, 1);
-    // dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
-    //            round_up(size(ceil_div(n, bN)), dimCluster.y));
+    dim3 dimGrid(round_up(size(ceil_div(M, bM)), dimCluster.x),
+             round_up(size(ceil_div(N, bN)), dimCluster.y));
     int smem_bytes = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
-    auto* kernel_ptr = &gemm_devicedecltype<(prob_shape), decltype(cta_tiler),
+    void const* kernel_ptr = reinterpret_cast<void const*>(
+                                &gemm_device<decltype(prob_shape), decltype(cta_tiler),
                                             TA, decltype(sA), decltype(tmaA),
                                             TB, decltype(sB), decltype(tmaB),
                                             TC, decltype(dC), decltype(tiled_mma),
-                                            decltype(alpha), decltype(beta)>;
+                                            decltype(alpha), decltype(beta)>);
+
+    CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
     cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
-    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, (void const*) kernel_ptr,
-                                                                prob_shape, cta_tiler,
-                                                                A, tmaA,
-                                                                B, tmaB,
-                                                                C, dC, tiled_mma,
-                                                                alpha, beta);
+    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
+                                                prob_shape, cta_tiler,
+                                            A, tmaA,
+                                            B, tmaB,
+                                            C, dC, tiled_mma,
+                                            alpha, beta);
 
 
 }
@@ -229,16 +234,15 @@ void gemm_tn(int m, int n, int k,
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
 
-    Copy_Atom tma_a = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
-    Copy_Atom tma_b = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
+    Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
+    Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
     dim3 dimBlock(size(tiled_mma));
-    dim3 dimGrid(ceil_div(M, bM), ceil_div(N, bN));
     dim3 dimCluster(2, 1, 1);
-    // dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
-    //            round_up(size(ceil_div(n, bN)), dimCluster.y));
+    dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
+               round_up(size(ceil_div(n, bN)), dimCluster.y));
     int smem_bytes = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<decltype(prob_shape), decltype(cta_tiler),
@@ -246,6 +250,9 @@ void gemm_tn(int m, int n, int k,
                                          TB, decltype(sB), decltype(tmaB),
                                          TC, decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta)>);
+    CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
     cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
     cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
                                                                 prob_shape, cta_tiler,
@@ -300,7 +307,7 @@ int main(int argc, char** argv) {
     using TI = cute::half_t;
 
     TI alpha = TI(1.0f);
-    TI beta = TI(1.0f.0f);
+    TI beta = TI(0.0f);
 
     thrust::host_vector<TA> h_A(m*k);
     thrust::host_vector<TB> h_B(n*k);
