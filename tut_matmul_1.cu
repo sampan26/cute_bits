@@ -11,6 +11,7 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 
+#include "cutlass/util/include/cutlass/util/GPU_Clock.hpp"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
 
@@ -321,6 +322,11 @@ int main(int argc, char** argv) {
     thrust::device_vector<TB> d_B = h_B;
     thrust::device_vector<TC> d_C = h_C;
 
+    double gflops = (2.0*m*n*k) * 1e-9;
+
+    const int timing_iterations = 100;
+    GPU_Clock timer;
+
     int ldA = 0, ldB = 0, ldC = m;
     if (transA == 'T') {
         ldA = k;
@@ -343,4 +349,18 @@ int main(int argc, char** argv) {
         beta,
         d_C.data().get(), ldC);
     thrust::host_vector<TC> cute_result = d_C;
+
+    timer.start();
+    for (int i = 0; i < timing_iterations; ++i) {
+        gemm(transA, transB, m, n, k,
+            alpha,
+            d_A.data().get(), ldA,
+            d_B.data().get(), ldB,
+            beta,
+            d_C.data().get(), ldC);
+    }
+    double cute_time = timer.seconds() / timing_iterations;
+    CUTE_CHECK_LAST();
+    printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+    return 0;
 }
