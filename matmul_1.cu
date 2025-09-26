@@ -11,7 +11,7 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 
-#include "cutlass/util/include/cutlass/util/GPU_Clock.hpp"
+#include "cutlass/tools/util/include/cutlass/util/GPU_Clock.hpp"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
 
