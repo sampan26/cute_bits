@@ -15,6 +15,10 @@
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
 
+// Add cuBLAS for verification
+#include <cublas_v2.h>
+#include <cmath>
+
 using namespace cute;
 
 template <class ElementA, class ElementB, class SmemLayoutA, class SmemLayoutB>
@@ -284,6 +288,50 @@ void gemm(char transA, char transB, int m, int n, int k,
     assert(false && "Not implemented");
 }
 
+// Verification function
+bool verify_matrix(const thrust::host_vector<cute::half_t>& ref, 
+                  const thrust::host_vector<cute::half_t>& test, 
+                  int m, int n, float tolerance = 0.1f)
+{
+    for (int i = 0; i < m * n; i++) {
+        float ref_val = static_cast<float>(ref[i]);
+        float test_val = static_cast<float>(test[i]);
+        float diff = std::abs(ref_val - test_val);
+        
+        if (diff > tolerance) {
+            printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
+                   ref_val, test_val, diff, i);
+            return false;
+        }
+    }
+    return true;
+}
+
+// cuBLAS reference implementation
+void run_cublas_gemm(cublasHandle_t handle, char transA, char transB, 
+                     int m, int n, int k, float alpha,
+                     const cute::half_t* A, int ldA,
+                     const cute::half_t* B, int ldB, 
+                     float beta, cute::half_t* C, int ldC)
+{
+    cublasOperation_t opA = (transA == 'T') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = (transB == 'T') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    
+    cublasStatus_t status = cublasGemmEx(handle, 
+                                        opA, opB, 
+                                        m, n, k, 
+                                        &alpha, 
+                                        A, CUDA_R_16F, ldA,
+                                        B, CUDA_R_16F, ldB, 
+                                        &beta, 
+                                        C, CUDA_R_16F, ldC,
+                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("cuBLAS error: %d\n", status);
+        exit(1);
+    }
+}
+
 int main(int argc, char** argv) {
     int m = 4096;
     if (argc >= 2)
@@ -321,6 +369,7 @@ int main(int argc, char** argv) {
     thrust::device_vector<TA> d_A = h_A;
     thrust::device_vector<TB> d_B = h_B;
     thrust::device_vector<TC> d_C = h_C;
+    thrust::device_vector<TC> d_C_ref = h_C;  // Reference result
 
     double gflops = (2.0*m*n*k) * 1e-9;
 
@@ -341,15 +390,47 @@ int main(int argc, char** argv) {
         ldB = n;
     }
 
-    d_C = h_C;
+    // Initialize cuBLAS
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+
+    printf("Running correctness verification...\n");
+    
+    // Run cuBLAS reference
+    d_C_ref = h_C;  // Reset
+    run_cublas_gemm(cublas_handle, transA, transB, m, n, k, 
+                   static_cast<float>(alpha),
+                   d_A.data().get(), ldA,
+                   d_B.data().get(), ldB,
+                   static_cast<float>(beta),
+                   d_C_ref.data().get(), ldC);
+    
+    // Run CuTe implementation
+    d_C = h_C;  // Reset
     gemm(transA, transB, m, n, k,
         alpha,
         d_A.data().get(), ldA,
         d_B.data().get(), ldB,
         beta,
         d_C.data().get(), ldC);
+    
+    // Copy results back to host for verification
     thrust::host_vector<TC> cute_result = d_C;
+    thrust::host_vector<TC> cublas_result = d_C_ref;
+    
+    // Verify correctness
+    bool passed = verify_matrix(cublas_result, cute_result, m, n);
+    if (passed) {
+        printf("✓ Correctness verification passed!\n");
+    } else {
+        printf("✗ Correctness verification FAILED!\n");
+        cublasDestroy(cublas_handle);
+        return 1;
+    }
 
+    printf("Running performance benchmark...\n");
+    
+    // Performance timing
     timer.start();
     for (int i = 0; i < timing_iterations; ++i) {
         gemm(transA, transB, m, n, k,
@@ -362,5 +443,8 @@ int main(int argc, char** argv) {
     double cute_time = timer.seconds() / timing_iterations;
     CUTE_CHECK_LAST();
     printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+    
+    // Cleanup
+    cublasDestroy(cublas_handle);
     return 0;
 }
