@@ -6,11 +6,13 @@
 #include <thrust/device_vector.h>
 
 #include <cute/tensor.hpp>
+#include <cutlass/arch/barrier.h>
 
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 
+#include "cutlass/include/cutlass/arch/reg_reconfig.h"
 #include "cutlass/tools/util/include/cutlass/util/GPU_Clock.hpp"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
@@ -27,7 +29,7 @@ struct SharedStorage
     alignas(128) cute::ArrayEngine<T, cosize_v<SmemLayoutA>> A;
     alignas(128) cute::ArrayEngine<T, cosize_v<SmemLayoutB>> B;
 
-    typename cutlass::PipelineTmaAsync<size<2>SmemLayoutA{}>::SharedStorage pipeline;
+    typename cutlass::PipelineTmaAsync<size<2>(SmemLayoutA{})>::SharedStorage pipeline;
 };
 
 
@@ -47,9 +49,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Alpha alpha, Beta beta)
 {
     auto [M, N, K] = shape_MNK;
-    auto [bM, bK, K_PIPE_MAX] = shape(SmemLayoutA);
+    auto [bM, bK, K_PIPE_MAX] = shape(SmemLayoutA{});
 
-    using MainloopPipeline = cutlass::PipelineTmaAsync<bP>;
+    using MainloopPipeline = cutlass::PipelineTmaAsync<K_PIPE_MAX>;
+    using PipelineState = typename MainloopPipeline::PipelineState;
     typename MainloopPipeline::Params params;
 
     extern __shared__ char shared_memory[];
@@ -76,7 +79,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     cluster_sync();
 
     if (warp_group_idx == 0) { // Producer
-        cutlass:arch::warpgroup_reg_dealloc<24>();
+        cutlass::arch::warpgroup_reg_dealloc<24>();
         int warp_idx_in_wg = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
 
         if (warp_idx_in_wg == 0) 
@@ -102,9 +105,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             if (lane_predicate)
             {
                 #pragma unroll 1
-                for (int k_tile = 0; k_tile < k_tile_count; ++k) {
-                    pipeline.producer_aquire(smem_pipe_write);
-                    uint64_t* full_barrier = pipeline.producer_get_barrier(write_state);
+                for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
+                    pipeline.producer_acquire(smem_pipe_write);
+                    uint64_t* full_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
                     auto pipe = smem_pipe_write.index();
                     copy(tma_a.with(*full_barrier, 0), tAgA(_, _, k_tile), tAsA(_, _, pipe));
@@ -124,7 +127,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
             Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
 
-            ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x);
+            ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
             Tensor tCsA = thr_mma.partition_A(sA);
             Tensor tCsB = thr_mma.partition_B(sB);
             Tensor tCgC = thr_mma.partition_C(gC);
@@ -140,16 +143,16 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                 pipeline.consumer_wait(smem_pipe_read);
                 auto read_stage = smem_pipe_read.index();
                 warpgroup_arrive();
-                gemm(mma, tCrA(_,_,_,read_stage), tCrB(_,_,_,read_stage). tCrC);
+                gemm(mma, tCrA(_,_,_,read_stage), tCrB(_,_,_,read_stage), tCrC);
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
 
                 pipeline.consumer_release(smem_pipe_read);
                 ++smem_pipe_read;
             }
+            cutlass::arch::NamedBarrier::sync(kConsumerWGs * 32 * 4, 0);
+            axpby(alpha, tCrC, beta, tCgC);
         }
-        cutlass::arch::NamedBarrier::sync(kConsumerWGs * 32 * 4, 0);
-        axpby(alpha, tCrC, beta, tCgC);
     }
 }
 
@@ -177,8 +180,8 @@ void gemm_nt(int m, int n, int k,
     auto cta_tiler = make_shape(bM, bN, bK);
     auto bP = Int<3>{};
 
-    auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TA>{}, make_shape(bM, bK, bP));
-    auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TB>{}, make_shape(bN, bK, bP));
+    auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
+    auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
@@ -196,16 +199,26 @@ void gemm_nt(int m, int n, int k,
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
-    dim3 dimGrid(size(ceil_div(m, bM)),size(ceil_div(n, bN)),);
+    dim3 dimGrid(ceil_div(m, bM),ceil_div(n, bN));
     int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
-                            &gemm_device<decltype(prob_shape), decltype(cta_tiler),
+                            &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
                                          decltype(sB), decltype(tmaB),
                                          decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta),
                                          kWarps, kWarpGroups, kConsumerWGs, kThreads>);
+    CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
 
+    cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
+    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
+                                                                prob_shape, cta_tiler,
+                                                                A, tmaA,
+                                                                B, tmaB,
+                                                                C, dC, tiled_mma,
+                                                                alpha, beta);
 
 
 }
@@ -235,8 +248,8 @@ void gemm_tn(int m, int n, int k,
     auto cta_tiler = make_shape(bM, bN, bK);
     auto bP = Int<4>{};
 
-    auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{}, make_shape(bM, bK, bP));
-    auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{}, make_shape(bN, bK, bP));
+    auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bK, bP));
+    auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bN, bK, bP));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
@@ -254,10 +267,10 @@ void gemm_tn(int m, int n, int k,
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
-    dim3 dimGrid(size(ceil_div(m, bM)),size(ceil_div(n, bN)),);
+    dim3 dimGrid(ceil_div(m, bM), ceil_div(n, bN));
     int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
-                            &gemm_device<decltype(prob_shape), decltype(cta_tiler),
+                            &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
                                          decltype(sB), decltype(tmaB),
                                          decltype(dC), decltype(tiled_mma),
@@ -270,7 +283,7 @@ void gemm_tn(int m, int n, int k,
 
     cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
     cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
-                                                                prob_shape, cta_tiler, ss,
+                                                                prob_shape, cta_tiler,
                                                                 A, tmaA,
                                                                 B, tmaB,
                                                                 C, dC, tiled_mma,
@@ -359,26 +372,24 @@ int main(int argc, char** argv) {
     if (argc >= 6)
         sscanf(argv[5], "%c", &transB);
 
-    using TA = cute::half_t;
-    using TB = cute::half_t;
-    using TC = cute::half_t;
+    using T = cute::half_t;
     using TI = cute::half_t;
 
     TI alpha = TI(1.0f);
     TI beta = TI(0.0f);
 
-    thrust::host_vector<TA> h_A(m*k);
-    thrust::host_vector<TB> h_B(n*k);
-    thrust::host_vector<TC> h_C(m*n);
+    thrust::host_vector<T> h_A(m*k);
+    thrust::host_vector<T> h_B(n*k);
+    thrust::host_vector<T> h_C(m*n);
 
-    for (int j = 0; j < m*k; ++j) h_A[j] = TA(int((rand() % 2) ? 1 : -1));
-    for (int j = 0; j < n*k; ++j) h_B[j] = TB(int((rand() % 2) ? 1 : -1));
-    for (int j = 0; j < m*n; ++j) h_C[j] = TC(0);
+    for (int j = 0; j < m*k; ++j) h_A[j] = T(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < n*k; ++j) h_B[j] = T(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < m*n; ++j) h_C[j] = T(0);
 
-    thrust::device_vector<TA> d_A = h_A;
-    thrust::device_vector<TB> d_B = h_B;
-    thrust::device_vector<TC> d_C = h_C;
-    thrust::device_vector<TC> d_C_ref = h_C;  // Reference result
+    thrust::device_vector<T> d_A = h_A;
+    thrust::device_vector<T> d_B = h_B;
+    thrust::device_vector<T> d_C = h_C;
+    thrust::device_vector<T> d_C_ref = h_C;  // Reference result
 
     double gflops = (2.0*m*n*k) * 1e-9;
 
@@ -424,8 +435,8 @@ int main(int argc, char** argv) {
         d_C.data().get(), ldC);
     
     // Copy results back to host for verification
-    thrust::host_vector<TC> cute_result = d_C;
-    thrust::host_vector<TC> cublas_result = d_C_ref;
+    thrust::host_vector<T> cute_result = d_C;
+    thrust::host_vector<T> cublas_result = d_C_ref;
     
     // Verify correctness
     bool passed = verify_matrix(cublas_result, cute_result, m, n);
