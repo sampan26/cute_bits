@@ -70,7 +70,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     params.role = warp_group_idx==0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
     params.is_leader = (threadIdx.x % 128) == 0;
     params.num_consumers = kConsumerWGs * 128;
-    params.transaction_bytes = sizeof(smem.A) + sizeof(smem.B);
+
+    static constexpr size_t kBytesA = sizeof(cute::ArrayEngine<T, size(SmemLayoutA{}(_,_,0))>);
+    static constexpr size_t kBytesB = sizeof(cute::ArrayEngine<T, size(SmemLayoutB{}(_,_,0))>);
+    params.transaction_bytes = kBytesA + kBytesB;
 
     MainloopPipeline pipeline(smem.pipeline, params, Shape<_1, _1, _1>{});
 
