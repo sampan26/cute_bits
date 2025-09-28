@@ -6,7 +6,7 @@
 #include <thrust/device_vector.h>
 
 #include <cute/tensor.hpp>
-
+#include "cutlass/tools/util/include/cutlass/util/print_error.hpp"
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
@@ -21,6 +21,7 @@
 #include <cmath>
 
 using namespace cute;
+
 
 template <typename T, class SmemLayoutA, class SmemLayoutB>
 struct SharedStorage
@@ -37,7 +38,8 @@ template <typename T, class ProblemShape, class CtaTiler,
           class SmemLayoutB, class TmaB,
           class CStride, class TiledMma,
           class Alpha, class Beta, 
-          int kWarps, int kWarpGroups, int kConsumerWGs, int kThreads>
+          int kWarps, int kWarpGroups, int kConsumerWGs, int kThreads,
+          int bM, int bN, int bK, int PIPE>
 __global__ static
 __launch_bounds__(kThreads)
 void
@@ -48,9 +50,6 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Alpha alpha, Beta beta)
 {
     auto [M, N, K] = shape_MNK;
-    static constexpr int PIPE = cute::size<2>(SmemLayoutA{});
-    constexpr int BK = cute::get<1>(cute::shape(SmemLayoutA{})); 
-
     using MainloopPipeline = cutlass::PipelineTmaAsync<PIPE>;
     using PipelineState = typename MainloopPipeline::PipelineState;
     typename MainloopPipeline::Params params;
@@ -102,57 +101,56 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                  group_modes<0,2>(sB), group_modes<0,2>(gB));
 
             int lane_predicate = cute::elect_one_sync();
-            if (lane_predicate)
-            {
+            if (lane_predicate) {
                 #pragma unroll 1
                 for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
                     pipeline.producer_acquire(smem_pipe_write);
                     uint64_t* full_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
                     auto pipe = smem_pipe_write.index();
-                    copy(tma_a.with(*full_barrier, 0), tAgA(_, _, k_tile), tAsA(_, _, pipe));
-                    copy(tma_b.with(*full_barrier, 0), tBgB(_, _, k_tile), tBsB(_, _, pipe));
+                    copy(tma_a.with(*full_barrier, 0), tAgA(_,k_tile), tAsA(_,pipe));
+                    copy(tma_b.with(*full_barrier, 0), tBgB(_,k_tile), tBsB(_,pipe));
                     ++smem_pipe_write;
                 }
             }
         }
-        else 
-        {
-            cutlass::arch::warpgroup_reg_alloc<240>();
-            PipelineState smem_pipe_read;
-            Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N));
-            auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
-            Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+    }
+    else 
+    {
+        cutlass::arch::warpgroup_reg_alloc<240>();
+        PipelineState smem_pipe_read;
+        Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M, N));
+        auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
+        Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
 
-            Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-            Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
+        Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
+        Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
 
-            auto thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
-            Tensor tCsA = thr_mma.partition_A(sA);
-            Tensor tCsB = thr_mma.partition_B(sB);
-            Tensor tCgC = thr_mma.partition_C(gC);
+        auto thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
+        Tensor tCsA = thr_mma.partition_A(sA);
+        Tensor tCsB = thr_mma.partition_B(sB);
+        Tensor tCgC = thr_mma.partition_C(gC);
 
-            Tensor tCrC = thr_mma.make_fragment_C(tCgC);
-            clear(tCrC);
+        Tensor tCrC = thr_mma.make_fragment_C(tCgC);
+        clear(tCrC);
         
-            Tensor tCrA = thr_mma.make_fragment_A(tCsA);
-            Tensor tCrB = thr_mma.make_fragment_B(tCsB);
+        Tensor tCrA = thr_mma.make_fragment_A(tCsA);
+        Tensor tCrB = thr_mma.make_fragment_B(tCsB);
             
-            #pragma unroll 1
-            for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
-                pipeline.consumer_wait(smem_pipe_read);
-                auto read_stage = smem_pipe_read.index();
-                warpgroup_arrive();
-                gemm(mma, tCrA(_,_,_,read_stage), tCrB(_,_,_,read_stage), tCrC);
-                warpgroup_commit_batch();
-                warpgroup_wait<0>();
+        #pragma unroll 1
+        for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
+            pipeline.consumer_wait(smem_pipe_read);
+            auto read_stage = smem_pipe_read.index();
+            warpgroup_arrive();
+            gemm(mma, tCrA(_,_,_,read_stage), tCrB(_,_,_,read_stage), tCrC);
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
 
-                pipeline.consumer_release(smem_pipe_read);
-                ++smem_pipe_read;
-            }
-            cutlass::arch::NamedBarrier::sync(kConsumerWGs * 32 * 4, 0);
-            axpby(alpha, tCrC, beta, tCgC);
+            pipeline.consumer_release(smem_pipe_read);
+            ++smem_pipe_read;
         }
+        cutlass::arch::NamedBarrier::sync(kConsumerWGs * 32 * 4, 0);
+        axpby(alpha, tCrC, beta, tCgC);
     }
 }
 
@@ -207,7 +205,8 @@ void gemm_nt(int m, int n, int k,
                                          decltype(sB), decltype(tmaB),
                                          decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta),
-                                         kWarps, kWarpGroups, kConsumerWGs, kThreads>);
+                                         kWarps, kWarpGroups, kConsumerWGs, kThreads,
+                                         bM, bN, bK, bP>);
     CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_bytes));
@@ -260,7 +259,7 @@ void gemm_tn(int m, int n, int k,
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
     static constexpr int kWarps = 12;
-    static constexpr int kWarpGroups = 12;
+    static constexpr int kWarpGroups = kWarps/4;
     static constexpr int kConsumerWGs = kWarpGroups - 1;
     static constexpr int kThreads = kWarps * 32;
 
@@ -275,7 +274,8 @@ void gemm_tn(int m, int n, int k,
                                          decltype(sB), decltype(tmaB),
                                          decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta),
-                                         kWarps, kWarpGroups, kConsumerWGs, kThreads>);
+                                         kWarps, kWarpGroups, kConsumerWGs, kThreads,
+                                         bM, bN, bK, bP>);
 
     CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -408,9 +408,9 @@ int main(int argc, char** argv) {
     }
     else {
         ldB = n;
-    }
+    }    
 
-    // Initialize cuBLAS
+    // // Initialize cuBLAS
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
 
@@ -433,7 +433,7 @@ int main(int argc, char** argv) {
         d_B.data().get(), ldB,
         beta,
         d_C.data().get(), ldC);
-    
+
     // Copy results back to host for verification
     thrust::host_vector<T> cute_result = d_C;
     thrust::host_vector<T> cublas_result = d_C_ref;
@@ -464,7 +464,7 @@ int main(int argc, char** argv) {
     CUTE_CHECK_LAST();
     printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
     
-    // Cleanup
+    // // Cleanup
     cublasDestroy(cublas_handle);
     return 0;
 }
