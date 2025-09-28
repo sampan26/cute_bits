@@ -23,13 +23,13 @@
 using namespace cute;
 
 
-template <typename T, class SmemLayoutA, class SmemLayoutB>
+template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB>
 struct SharedStorage
 {
-    alignas(128) cute::ArrayEngine<T, cosize_v<SmemLayoutA>> A;
-    alignas(128) cute::ArrayEngine<T, cosize_v<SmemLayoutB>> B;
+    array_aligned<T, cosize_v<SmemLayoutA>, 128> A;
+    array_aligned<T, cosize_v<SmemLayoutB>, 128> B;
 
-    typename cutlass::PipelineTmaAsync<size<2>(SmemLayoutA{})>::SharedStorage pipeline;
+    typename cutlass::PipelineTmaAsync<PIPE>::SharedStorage pipeline;
 };
 
 
@@ -55,7 +55,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     typename MainloopPipeline::Params params;
 
     extern __shared__ char shared_memory[];
-    using SharedStorage = SharedStorage<T, SmemLayoutA, SmemLayoutB>;
+    using SharedStorage = SharedStorage<T, PIPE, SmemLayoutA, SmemLayoutB>;
     SharedStorage& smem = *reinterpret_cast<SharedStorage *>(shared_memory);
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -95,8 +95,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
             Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
-            Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-            Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
+            Tensor sA = make_tensor(make_smem_ptr(smem.A.data()), SmemLayoutA{});
+            Tensor sB = make_tensor(make_smem_ptr(smem.B.data()), SmemLayoutB{});
 
             auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
                 group_modes<0,2>(sA), group_modes<0,2>(gA));
@@ -175,11 +175,11 @@ void gemm_nt(int m, int n, int k,
     auto dB = make_stride(Int<1>{}, ldB);
     auto dC = make_stride(Int<1>{}, ldC);
 
-    auto bM = Int<128>{};
+    auto bM = Int<256>{};
     auto bN = Int<128>{};
     auto bK = Int<64>{};
     auto cta_tiler = make_shape(bM, bN, bK);
-    auto bP = Int<3>{};
+    auto bP = Int<4>{};
 
     auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
@@ -190,18 +190,18 @@ void gemm_nt(int m, int n, int k,
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
-    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
-
     static constexpr int kWarps = 12;
     static constexpr int kWarpGroups = kWarps/4;
     static constexpr int kConsumerWGs = kWarpGroups - 1;
     static constexpr int kThreads = kWarps * 32;
 
+    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
+
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
     dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
-    int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
+    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
@@ -259,18 +259,42 @@ void gemm_tn(int m, int n, int k,
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
 
-    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
+    //TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
     static constexpr int kWarps = 12;
     static constexpr int kWarpGroups = kWarps/4;
     static constexpr int kConsumerWGs = kWarpGroups - 1;
     static constexpr int kThreads = kWarps * 32;
+    using mma_op = decltype(
+        SM90_64x64x16_F16F16F16_SS<GMMA::Major::K,GMMA::Major::K>{}
+    );
+    using mma_traits = MMA_Traits<mma_op>;
+    using mma_atom = MMA_Atom<mma_traits>;
 
+    static constexpr int kMmaEURepeatM = kConsumerWGs;
+    static constexpr int kMmaEURepeatN = 1;
+    static constexpr int kMmaEURepeatK = 1;
+    using mma_atom_shape = mma_traits::Shape_MNK;
+    static constexpr int MmaVM = 1 * kMmaEURepeatM * get<0>(mma_atom_shape{});
+    static constexpr int MmaVN = 1 * kMmaEURepeatN * get<1>(mma_atom_shape{});
+    static constexpr int MmaVK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{});
+    using MMA_EU_RepeatT = decltype(
+        make_layout(
+            make_shape(Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})
+        )
+    );
+
+    // Thread workload repetition 1x1x1
+    // Each mode of this shape can be a layout to do permutation on the corresponding layout mode
+    using MMA_V_RepeatT = decltype(
+        make_shape(Int<MmaVM>{}, Int<MmaVN>{}, Int<MmaVK>{})
+    );
+    TiledMMA tiled_mma = make_tiled_mma(mma_atom{}, MMA_EU_RepeatT{}, MMA_V_RepeatT{});
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
     dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
-    int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
+    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
