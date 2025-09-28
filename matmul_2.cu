@@ -6,7 +6,6 @@
 #include <thrust/device_vector.h>
 
 #include <cute/tensor.hpp>
-#include <cutlass/arch/barrier.h>
 
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/arch/barrier.h"
@@ -49,9 +48,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Alpha alpha, Beta beta)
 {
     auto [M, N, K] = shape_MNK;
-    auto [bM, bK, K_PIPE_MAX] = shape(SmemLayoutA{});
+    static constexpr int PIPE = cute::size<2>(SmemLayoutA{});
+    constexpr int BK = cute::get<1>(cute::shape(SmemLayoutA{})); 
 
-    using MainloopPipeline = cutlass::PipelineTmaAsync<K_PIPE_MAX>;
+    using MainloopPipeline = cutlass::PipelineTmaAsync<PIPE>;
     using PipelineState = typename MainloopPipeline::PipelineState;
     typename MainloopPipeline::Params params;
 
@@ -127,7 +127,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
             Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
 
-            ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
+            auto thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
             Tensor tCsA = thr_mma.partition_A(sA);
             Tensor tCsB = thr_mma.partition_B(sB);
             Tensor tCgC = thr_mma.partition_C(gC);
@@ -192,14 +192,14 @@ void gemm_nt(int m, int n, int k,
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
 
     static constexpr int kWarps = 12;
-    static constexpr int kWarpGroups = 12;
+    static constexpr int kWarpGroups = kWarps/4;
     static constexpr int kConsumerWGs = kWarpGroups - 1;
     static constexpr int kThreads = kWarps * 32;
 
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
-    dim3 dimGrid(ceil_div(m, bM),ceil_div(n, bN));
+    dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
     int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
@@ -267,7 +267,7 @@ void gemm_tn(int m, int n, int k,
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
-    dim3 dimGrid(ceil_div(m, bM), ceil_div(n, bN));
+    dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
     int smem_bytes = int(sizeof(SharedStorage<T, decltype(sA), decltype(sB)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
