@@ -27,7 +27,10 @@ template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB>
 struct SharedStorage
 {
     array_aligned<T, cosize_v<SmemLayoutA>, 128> A;
-    array_aligned<T, cosize_v<SmemLayoutB>, 128> B;
+    union {
+        array_aligned<T, cosize_v<SmemLayoutB>, 128> smem_B;
+        array_aligned<T, cosize_v<SmemLayoutC>, 128> smem_C;
+    };
 
     typename cutlass::PipelineTmaAsync<PIPE>::SharedStorage pipeline;
 };
@@ -58,7 +61,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     typename MainloopPipeline::Params params;
 
     extern __shared__ char shared_memory[];
-    using SharedStorage = SharedStorage<T, PIPE, SmemLayoutA, SmemLayoutB>;
+    using SharedStorage = SharedStorage<T, PIPE, SmemLayoutA, SmemLayoutB, SmemLayoutC>;
     SharedStorage& smem = *reinterpret_cast<SharedStorage *>(shared_memory);
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
@@ -68,6 +71,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
     if (warp_idx==0 && lane_predicate) {
         cute::prefetch_tma_descriptor(tma_a.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_b.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_c.get_tma_descriptor());
     }
 
     params.role = warp_group_idx==0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
@@ -134,7 +138,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         Tensor tCsA = thr_mma.partition_A(sA);
         Tensor tCsB = thr_mma.partition_B(sB);
 
-        Tensor tCrC = partition_fragment_C(TiledMma{}, Shape<Int<bM>, Int<bK>>{});
+        Tensor tCrC = partition_fragment_C(TiledMma{}, Shape<Int<bM>, Int<bN>>{});
         clear(tCrC);
         
         Tensor tCrA = thr_mma.make_fragment_A(tCsA);
@@ -156,14 +160,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 
         // Epilogue Store
         {
-            Tensor sC = make_tensor(make_smem_ptr(C), SmemLayoutC{});
+            Tensor sC = make_tensor(make_smem_ptr(smem.C.data()), SmemLayoutC{});
             auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC{}, mma);
             auto r2s_thr_copy = r2s_tiled_copy.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
 
             Tensor tAccCrC = r2s_thr_copy.retile_S(tCrC);
             Tensor tAccCsC = r2s_thr_copy.partition_D(sC);
 
-            copy(r2s_thr_copy, tAccCrC, tAccCsC);
+            copy(r2s_tiled_copy, tAccCrC, tAccCsC);
             cutlass::arch::fence_view_async_shared();
             cutlass::arch::NamedBarrier::arrive(kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
@@ -241,7 +245,7 @@ void gemm_nt(int m, int n, int k,
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
     dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
-    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB)>));
+    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB), decltype(sC)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
@@ -292,13 +296,13 @@ void gemm_tn(int m, int n, int k,
     auto cta_tiler = make_shape(bM, bN, bK);
     auto bP = Int<4>{};
 
-    auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
-    auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
-    auto sC = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bN));
+    auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bK, bP));
+    auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bN, bK, bP));
+    auto sC = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bN));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
-    Tensor mC = make_tnesor(C, make_shape(M, N), dC);
+    Tensor mC = make_tensor(C, make_shape(M, N), dC);
 
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
@@ -341,7 +345,7 @@ void gemm_tn(int m, int n, int k,
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
     dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
-    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB)>));
+    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB), decltype(sC)>));
     void const* kernel_ptr = reinterpret_cast<void const*>(
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
