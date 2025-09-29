@@ -36,7 +36,8 @@ struct SharedStorage
 template <typename T, class ProblemShape, class CtaTiler,
           class SmemLayoutA, class TmaA,
           class SmemLayoutB, class TmaB,
-          class SmemLayoutC, class SmemCopyAtomC, 
+          class SmemLayoutC, class TmaC,
+          class SmemCopyAtomC, 
           class CStride, class TiledMma,
           class Alpha, class Beta, 
           int kWarps, int kWarpGroups, int kConsumerWGs, int kThreads,
@@ -47,7 +48,8 @@ void
 gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, 
             T const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a,
             T const* B, CUTLASS_GRID_CONSTANT TmaB const tma_b,
-            T      * C, CStride dC, TiledMma mma,
+            T      * C, CUTLASS_GRID_CONSTANT TmaC const tma_c,
+            CStride dC, TiledMma mma,
             Alpha alpha, Beta beta)
 {
     auto [M, N, K] = shape_MNK;
@@ -124,7 +126,6 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         cutlass::arch::warpgroup_reg_alloc<240>();
         PipelineState smem_pipe_read;
         auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
-        Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
 
         Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
         Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
@@ -132,9 +133,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         auto thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
         Tensor tCsA = thr_mma.partition_A(sA);
         Tensor tCsB = thr_mma.partition_B(sB);
-        Tensor tCgC = thr_mma.partition_C(gC);
 
-        Tensor tCrC = partition_fragment_C(typename mma, Shape<Int<bM>, Int<bK>>{});
+        Tensor tCrC = partition_fragment_C(TiledMma{}, Shape<Int<bM>, Int<bK>>{});
         clear(tCrC);
         
         Tensor tCrA = thr_mma.make_fragment_A(tCsA);
@@ -157,11 +157,39 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         // Epilogue Store
         {
             Tensor sC = make_tensor(make_smem_ptr(C), SmemLayoutC{});
-            auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC, mma);
+            auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC{}, mma);
             auto r2s_thr_copy = r2s_tiled_copy.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
 
+            Tensor tAccCrC = r2s_thr_copy.retile_S(tCrC);
+            Tensor tAccCsC = r2s_thr_copy.partition_D(sC);
+
+            copy(r2s_thr_copy, tAccCrC, tAccCsC);
+            cutlass::arch::fence_view_async_shared();
+            cutlass::arch::NamedBarrier::arrive(kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+
+            Tensor mC = tma_c.get_tma_tensor(make_shape(M, N));
+            auto cta_coord = make_coord(blockIdx.x, blockIdx.y);
+            Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
             
+            auto s2g_thr_copy = tma_c.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
+            Tensor tCsC = s2g_thr_copy.partition_S(sC);
+            Tensor tCgC = s2g_thr_copy.partition_D(gC);
+
+            int write_warp_idx = kWarps - 1;
+            int const warp_idx = cutlass::canonical_warp_idx_sync();
+            int const lane_predicate = cute::elect_one_sync();
+            if (warp_idx == write_warp_idx) {
+                cutlass::arch::NamedBarrier::sync(
+                    kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
+                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+                );
+            }
+            if (warp_idx == write_warp_idx && lane_predicate) {
+                copy(tma_c, tCsC, tCgC);
+                tma_store_arrive();
+            }
         }
+        tma_store_wait<0>();
     }
 }
 
@@ -195,10 +223,13 @@ void gemm_nt(int m, int n, int k,
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
+    Tensor mC = make_tensor(C, make_shape(M, N), dC);
 
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
-    Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>;
+    Copy_Atom tmaC = make_tma_atom(SM90_TMA_STORE{}, mC, sC(_, _), make_shape(bM, bN));
+
+    Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>{};
 
     static constexpr int kWarps = 12;
     static constexpr int kWarpGroups = kWarps/4;
@@ -206,7 +237,6 @@ void gemm_nt(int m, int n, int k,
     static constexpr int kThreads = kWarps * 32;
 
     TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
-
 
     dim3 dimBlock(kThreads);
     dim3 dimCluster(1, 1, 1);
@@ -216,7 +246,8 @@ void gemm_nt(int m, int n, int k,
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
                                          decltype(sB), decltype(tmaB),
-                                         decltype(sC), decltype(copy_c),
+                                         decltype(sC), decltype(tmaC),
+                                         decltype(copy_c),
                                          decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta),
                                          kWarps, kWarpGroups, kConsumerWGs, kThreads,
@@ -230,7 +261,7 @@ void gemm_nt(int m, int n, int k,
                                                                 prob_shape, cta_tiler,
                                                                 A, tmaA,
                                                                 B, tmaB,
-                                                                C, dC, tiled_mma,
+                                                                C, tmaC, dC, tiled_mma,
                                                                 alpha, beta);
 
 
@@ -261,16 +292,19 @@ void gemm_tn(int m, int n, int k,
     auto cta_tiler = make_shape(bM, bN, bK);
     auto bP = Int<4>{};
 
-    auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bK, bP));
-    auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bN, bK, bP));
-    auto sC = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bN));
+    auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
+    auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
+    auto sC = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bN));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
+    Tensor mC = make_tnesor(C, make_shape(M, N), dC);
 
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
-    Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>;
+    Copy_Atom tmaC = make_tma_atom(SM90_TMA_STORE{}, mC, sC(_, _), make_shape(bM, bN));
+
+    Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>{};
 
     //TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
@@ -312,7 +346,8 @@ void gemm_tn(int m, int n, int k,
                             &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
                                          decltype(sA), decltype(tmaA),
                                          decltype(sB), decltype(tmaB),
-                                         decltype(sC), decltype(copy_c),
+                                         decltype(sC), decltype(tmaC),
+                                         decltype(copy_c),
                                          decltype(dC), decltype(tiled_mma),
                                          decltype(alpha), decltype(beta),
                                          kWarps, kWarpGroups, kConsumerWGs, kThreads,
@@ -327,7 +362,7 @@ void gemm_tn(int m, int n, int k,
                                                                 prob_shape, cta_tiler,
                                                                 A, tmaA,
                                                                 B, tmaB,
-                                                                C, dC, tiled_mma,
+                                                                C, tmaC, dC, tiled_mma,
                                                                 alpha, beta);
 
 
