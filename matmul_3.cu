@@ -223,7 +223,7 @@ void gemm_nt(int m, int n, int k,
 
     auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
-    auto sC = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bN));
+    auto sC = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bN));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
