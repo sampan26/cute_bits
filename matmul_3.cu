@@ -23,10 +23,10 @@
 using namespace cute;
 
 
-template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB>
+template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB, class SmemLayoutC>
 struct SharedStorage
 {
-    array_aligned<T, cosize_v<SmemLayoutA>, 128> A;
+    array_aligned<T, cosize_v<SmemLayoutA>, 128> smem_A;
     union {
         array_aligned<T, cosize_v<SmemLayoutB>, 128> smem_B;
         array_aligned<T, cosize_v<SmemLayoutC>, 128> smem_C;
@@ -102,8 +102,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
             Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
 
-            Tensor sA = make_tensor(make_smem_ptr(smem.A.data()), SmemLayoutA{});
-            Tensor sB = make_tensor(make_smem_ptr(smem.B.data()), SmemLayoutB{});
+            Tensor sA = make_tensor(make_smem_ptr(smem.smem_A.data()), SmemLayoutA{});
+            Tensor sB = make_tensor(make_smem_ptr(smem.smem_B.data()), SmemLayoutB{});
 
             auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
                 group_modes<0,2>(sA), group_modes<0,2>(gA));
@@ -131,8 +131,8 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         PipelineState smem_pipe_read;
         auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
 
-        Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-        Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
+        Tensor sA = make_tensor(make_smem_ptr(smem.smem_A.data()), SmemLayoutA{});
+        Tensor sB = make_tensor(make_smem_ptr(smem.smem_B.data()), SmemLayoutB{});
 
         auto thr_mma = mma.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
         Tensor tCsA = thr_mma.partition_A(sA);
@@ -160,7 +160,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
 
         // Epilogue Store
         {
-            Tensor sC = make_tensor(make_smem_ptr(smem.C.data()), SmemLayoutC{});
+            Tensor sC = make_tensor(make_smem_ptr(smem.smem_C.data()), SmemLayoutC{});
             auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC{}, mma);
             auto r2s_thr_copy = r2s_tiled_copy.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
 
@@ -172,7 +172,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             cutlass::arch::NamedBarrier::arrive(kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
             Tensor mC = tma_c.get_tma_tensor(make_shape(M, N));
-            auto cta_coord = make_coord(blockIdx.x, blockIdx.y);
+            auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
             Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
             
             auto s2g_thr_copy = tma_c.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
