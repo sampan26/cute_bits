@@ -6,12 +6,14 @@
 #include <thrust/device_vector.h>
 
 #include <cute/tensor.hpp>
+#include <cutlass/cluster_launch.hpp>
+#include <cute/arch/copy_sm90.hpp>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/pipeline/pipeline.hpp>
+#include <cutlass/arch/reg_reconfig.h>
 #include "cutlass/tools/util/include/cutlass/util/print_error.hpp"
-#include "cutlass/cluster_launch.hpp"
-#include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 
-#include "cutlass/include/cutlass/arch/reg_reconfig.h"
 #include "cutlass/tools/util/include/cutlass/util/GPU_Clock.hpp"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass/device_kernel.h"
@@ -161,118 +163,48 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         // Epilogue Store
         {
             Tensor sC = make_tensor(make_smem_ptr(smem.smem_C.data()), SmemLayoutC{});
-            auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC{}, mma);
-            auto r2s_thr_copy = r2s_tiled_copy.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
 
+            TiledMma tiled_mma;
+            auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomC{}, tiled_mma);
+            auto r2s_thr_copy   = r2s_tiled_copy.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
             Tensor tAccCrC = r2s_thr_copy.retile_S(tCrC);
             Tensor tAccCsC = r2s_thr_copy.partition_D(sC);
-
             copy(r2s_tiled_copy, tAccCrC, tAccCsC);
             cutlass::arch::fence_view_async_shared();
-            cutlass::arch::NamedBarrier::arrive(kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-
-            Tensor mC = tma_c.get_tma_tensor(make_shape(M, N));
-            auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
-            Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
             
-            auto s2g_thr_copy = tma_c.get_thread_slice(threadIdx.x - cutlass::NumThreadsPerWarpGroup);
-            Tensor tCsC = s2g_thr_copy.partition_S(sC);
-            Tensor tCgC = s2g_thr_copy.partition_D(gC);
-
+            cutlass::arch::NamedBarrier::arrive(
+              kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
+              cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            
+            Tensor mC = tma_c.get_tma_tensor(make_shape(M, N));
+            Tensor gC_full = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
+            
+            // Partition for TMA store
+            auto cta_tma = tma_c.get_slice(_0{});
+            Tensor tCsC = cta_tma.partition_S(sC);
+            Tensor tCgC = cta_tma.partition_D(gC_full);
+            
+            // Designate last warp to issue the TMA store
             int write_warp_idx = kWarps - 1;
-            int const warp_idx = cutlass::canonical_warp_idx_sync();
-            int const lane_predicate = cute::elect_one_sync();
+            int warp_idx = cutlass::canonical_warp_idx_sync();
+            int lane_predicate = cute::elect_one_sync();
+            
             if (warp_idx == write_warp_idx) {
-                cutlass::arch::NamedBarrier::sync(
-                    kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
-                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
-                );
+              cutlass::arch::NamedBarrier::sync(
+                kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
+                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+              );
             }
             if (warp_idx == write_warp_idx && lane_predicate) {
-                copy(tma_c, tCsC, tCgC);
-                tma_store_arrive();
+              copy(tma_c, tCsC, tCgC);
+              tma_store_arrive();
             }
+            tma_store_wait<0>();
         }
-        tma_store_wait<0>();
     }
 }
 
 template <typename T, class Alpha, class Beta>
-void gemm_nt(int m, int n, int k,
-             Alpha alpha, 
-             T const* A, int ldA,
-             T const* B, int ldB,
-             Beta beta,
-             T *C, int ldC,
-             cudaStream_t stream=0)
-{
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto prob_shape = make_shape(M, N, K);
-
-    auto dA = make_stride(Int<1>{}, ldA);
-    auto dB = make_stride(Int<1>{}, ldB);
-    auto dC = make_stride(Int<1>{}, ldC);
-
-    auto bM = Int<256>{};
-    auto bN = Int<128>{};
-    auto bK = Int<64>{};
-    auto cta_tiler = make_shape(bM, bN, bK);
-    auto bP = Int<4>{};
-
-    auto sA = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bK, bP));
-    auto sB = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bN, bK, bP));
-    auto sC = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bN));
-
-    Tensor mA = make_tensor(A, make_shape(M, K), dA);
-    Tensor mB = make_tensor(B, make_shape(N, K), dB);
-    Tensor mC = make_tensor(C, make_shape(M, N), dC);
-
-    Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
-    Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
-    Copy_Atom tmaC = make_tma_atom(SM90_TMA_STORE{}, mC, sC(_, _), make_shape(bM, bN));
-
-    Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>{};
-
-    static constexpr int kWarps = 12;
-    static constexpr int kWarpGroups = kWarps/4;
-    static constexpr int kConsumerWGs = kWarpGroups - 1;
-    static constexpr int kThreads = kWarps * 32;
-
-    TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::MN, GMMA::Major::MN>{});
-
-    dim3 dimBlock(kThreads);
-    dim3 dimCluster(1, 1, 1);
-    dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
-    int smem_bytes = int(sizeof(SharedStorage<T, bP, decltype(sA), decltype(sB), decltype(sC)>));
-    void const* kernel_ptr = reinterpret_cast<void const*>(
-                            &gemm_device<T, decltype(prob_shape), decltype(cta_tiler),
-                                         decltype(sA), decltype(tmaA),
-                                         decltype(sB), decltype(tmaB),
-                                         decltype(sC), decltype(tmaC),
-                                         decltype(copy_c),
-                                         decltype(dC), decltype(tiled_mma),
-                                         decltype(alpha), decltype(beta),
-                                         kWarps, kWarpGroups, kConsumerWGs, kThreads,
-                                         bM, bN, bK, bP>);
-    CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes));
-
-    cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
-    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel_ptr,
-                                                                prob_shape, cta_tiler,
-                                                                A, tmaA,
-                                                                B, tmaB,
-                                                                C, tmaC, dC, tiled_mma,
-                                                                alpha, beta);
-
-
-}
-
-template <typename T,
-          class Alpha, class Beta>
 void gemm_tn(int m, int n, int k,
              Alpha alpha, 
              T const* A, int ldA,
@@ -299,18 +231,19 @@ void gemm_tn(int m, int n, int k,
     auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bM, bK, bP));
     auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<T>{}, make_shape(bN, bK, bP));
     auto sC = tile_to_shape(GMMA::Layout_MN_SW128_Atom<T>{}, make_shape(bM, bN));
+    using SmemLayoutC = decltype(sC);
+
+    auto gmemLayoutC = make_layout(make_shape(M, N), make_stride(_1{}, M));
 
     Tensor mA = make_tensor(A, make_shape(M, K), dA);
     Tensor mB = make_tensor(B, make_shape(N, K), dB);
-    Tensor mC = make_tensor(C, make_shape(M, N), dC);
+    Tensor mC = make_tensor(make_gmem_ptr(C), gmemLayoutC);
 
     Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_, _, 0), make_shape(bM, bK));
     Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_, _, 0), make_shape(bN, bK));
-    Copy_Atom tmaC = make_tma_atom(SM90_TMA_STORE{}, mC, sC(_, _), make_shape(bM, bN));
+    auto tmaC = make_tma_copy(SM90_TMA_STORE{}, mC, SmemLayoutC{}, make_shape(bM, bN), _1{});
 
     Copy_Atom copy_c = Copy_Atom<SM90_U16x8_STSM_T, T>{};
-
-    //TiledMMA tiled_mma = make_tiled_mma(SM90_64x64x16_F16F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
 
     static constexpr int kWarps = 12;
     static constexpr int kWarpGroups = kWarps/4;
@@ -368,8 +301,6 @@ void gemm_tn(int m, int n, int k,
                                                                 B, tmaB,
                                                                 C, tmaC, dC, tiled_mma,
                                                                 alpha, beta);
-
-
 }
 
 template <typename T, class Alpha, class Beta>
@@ -384,10 +315,7 @@ void gemm(char transA, char transB, int m, int n, int k,
     if (transA == 'T' && transB == 'N') {
         return gemm_tn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
     }
-    else if (transA == 'N' && transB == 'T') {
-        return gemm_nt(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, stream);
-    } 
-    assert(false && "Not implemented");
+    assert(false && "Only T-N transpose configuration is supported");
 }
 
 // Verification function
@@ -490,7 +418,7 @@ int main(int argc, char** argv) {
         ldB = n;
     }    
 
-    // // Initialize cuBLAS
+    // Initialize cuBLAS
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
 
@@ -528,23 +456,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Running performance benchmark...\n");
-    
-    // Performance timing
-    timer.start();
-    for (int i = 0; i < timing_iterations; ++i) {
-        gemm(transA, transB, m, n, k,
-            alpha,
-            d_A.data().get(), ldA,
-            d_B.data().get(), ldB,
-            beta,
-            d_C.data().get(), ldC);
-    }
-    double cute_time = timer.seconds() / timing_iterations;
-    CUTE_CHECK_LAST();
-    printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
-    
-    // // Cleanup
+    // Cleanup
     cublasDestroy(cublas_handle);
     return 0;
 }
