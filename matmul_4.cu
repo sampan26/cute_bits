@@ -250,7 +250,7 @@ void gemm_tn(int m, int n, int k,
     auto bN = Int<128>{};
     auto bK = Int<64>{};
     auto cta_tiler = make_shape(bM, bN, bK);
-    auto bP = Int<4>{};
+    auto bP = Int<3>{};
 
     int num_blocks_m = M / bM;
     int num_blocks_n = N / bN;
