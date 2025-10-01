@@ -29,10 +29,8 @@ template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB, class Smem
 struct SharedStorage
 {
     array_aligned<T, cosize_v<SmemLayoutA>, 128> smem_A;
-    union {
-        array_aligned<T, cosize_v<SmemLayoutB>, 128> smem_B;
-        array_aligned<T, cosize_v<SmemLayoutC>, 128> smem_C;
-    };
+    array_aligned<T, cosize_v<SmemLayoutB>, 128> smem_B;
+    array_aligned<T, cosize_v<SmemLayoutC>, 128> smem_C;
 
     typename cutlass::PipelineTmaAsync<PIPE>::SharedStorage pipeline;
 };
@@ -109,12 +107,12 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             Tensor sA = make_tensor(make_smem_ptr(smem.smem_A.data()), SmemLayoutA{});
             Tensor sB = make_tensor(make_smem_ptr(smem.smem_B.data()), SmemLayoutB{});
             
-            for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=blockDim.x)
+            for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x)
             {
                 int tile_group_idx = tile_idx / num_tiles_group;
-                int tile_idx_in_group = tile_idx % num_tiles_group;
-                int tile_m = tile_idx_in_group / group_size_m;
-                int tile_n = tile_idx_in_group % group_size_m;
+                int tile_in_group = tile_idx % num_tiles_group;
+                int tile_m = tile_in_group % group_size_m;
+                int tile_n = tile_in_group / group_size_m;
                 int group_m = tile_group_idx % (num_blocks_m / group_size_m);
                 int group_n = tile_group_idx / (num_blocks_m / group_size_m);
 
@@ -159,16 +157,16 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         Tensor tCrB = thr_mma.make_fragment_B(tCsB);
 
         Tensor tCrC = partition_fragment_C(TiledMma{}, Shape<Int<bM>, Int<bN>>{});
-        clear(tCrC);
 
-        for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=blockDim.x)
+        for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x)
         {
+            clear(tCrC);
             int tile_group_idx = tile_idx / num_tiles_group;
-            int tile_idx_in_group = tile_idx % num_tiles_group;
-            int tile_m = tile_idx_in_group % group_size_m;
-            int tile_n = tile_idx_in_group / group_size_m;
-            int grid_m = tile_idx_in_group % (num_blocks_m / group_size_m);
-            int grid_n = tile_idx_in_group / (num_blocks_m / group_size_m);            
+            int tile_in_group = tile_idx % num_tiles_group;
+            int tile_m = tile_in_group % group_size_m;
+            int tile_n = tile_in_group / group_size_m;
+            int grid_m = tile_group_idx % (num_blocks_m / group_size_m);
+            int grid_n = tile_group_idx / (num_blocks_m / group_size_m);            
 
             auto cta_coord = make_coord(grid_m * group_size_m + tile_m, grid_n * group_size_n + tile_n, _);
             #pragma unroll 1
