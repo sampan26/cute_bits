@@ -145,10 +145,10 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                     }
                 }
             }
-        int lane_predicate = cute::elect_one_sync();
-        if (lane_predicate) { 
-            pipeline.producer_tail(smem_pipe_write);
-        }
+            int lane_predicate = cute::elect_one_sync();
+            if (lane_predicate) { 
+                pipeline.producer_tail(smem_pipe_write);
+            }
         }
     }
     else 
@@ -222,14 +222,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
                 int lane_predicate = cute::elect_one_sync();
                 
                 if (warp_idx == write_warp_idx) {
-                cutlass::arch::NamedBarrier::sync(
-                    kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
-                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
-                );
+                    cutlass::arch::NamedBarrier::sync(
+                        kConsumerWGs * 32 * 4 + cutlass::NumThreadsPerWarp,
+                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+                    );
                 }
                 if (warp_idx == write_warp_idx && lane_predicate) {
-                copy(tma_c, tCsC, tCgC);
-                tma_store_arrive();
+                    copy(tma_c, tCsC, tCgC);
+                    tma_store_arrive();
                 }
                 tma_store_wait<0>();
             }
