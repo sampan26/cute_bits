@@ -456,6 +456,57 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    printf("Warming up...\n");
+    for (int i = 0; i < 5; ++i) {
+        gemm(transA, transB, m, n, k,
+            alpha,
+            d_A.data().get(), ldA,
+            d_B.data().get(), ldB,
+            beta,
+            d_C.data().get(), ldC);
+        
+        run_cublas_gemm(cublas_handle, transA, transB, m, n, k, 
+            static_cast<float>(alpha),
+            d_A.data().get(), ldA,
+            d_B.data().get(), ldB,
+            static_cast<float>(beta),
+            d_C_ref.data().get(), ldC);
+    }
+    CUTE_CHECK_LAST();
+    cudaDeviceSynchronize(); // Ensure all warmup kernels complete
+    
+    // Time CUTE implementation
+    cudaDeviceSynchronize(); // Ensure GPU is idle
+    timer.start();
+    for (int i = 0; i < timing_iterations; ++i) {
+        gemm(transA, transB, m, n, k,
+            alpha,
+            d_A.data().get(), ldA,
+            d_B.data().get(), ldB,
+            beta,
+            d_C.data().get(), ldC);
+    }
+    cudaDeviceSynchronize(); // Wait for all kernels to complete
+    double cute_time = timer.seconds() / timing_iterations;
+    CUTE_CHECK_LAST();
+    printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+    
+    // Time cuBLAS implementation
+    cudaDeviceSynchronize(); // Ensure GPU is idle
+    timer.start();
+    for (int i = 0; i < timing_iterations; ++i) {
+        run_cublas_gemm(cublas_handle, transA, transB, m, n, k, 
+            static_cast<float>(alpha),
+            d_A.data().get(), ldA,
+            d_B.data().get(), ldB,
+            static_cast<float>(beta),
+            d_C_ref.data().get(), ldC);
+    }
+    cudaDeviceSynchronize(); // Wait for all kernels to complete
+    double cublas_time = timer.seconds() / timing_iterations;
+    CUTE_CHECK_LAST();
+    printf("cuBLAS:        [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cublas_time, cublas_time*1000);
+    
     // Cleanup
     cublasDestroy(cublas_handle);
     return 0;
