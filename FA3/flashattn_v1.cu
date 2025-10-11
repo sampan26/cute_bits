@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     int B = 8;
     int T = 2048;      // sequence length
     int NH = 4;      // number of heads
-    int HS = 32;     // head size
+    int HEAD_DIM = 32;     // head size
     int D = NH * HS; // model dim per token
 
     using TQ = cute::bfloat16_t;
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     
     // Run CuTe implementation
     d_O = h_O;  // Reset
-    flash_attention(B, T, NH, D,
+    flash_attention(B, T, NH, HEAD_DIM,
         d_Q.data().get(),
         d_K.data().get(),
         d_V.data().get(),
