@@ -24,6 +24,17 @@
 
 using namespace cute;
 
+// Function to calculate tile coordinates from tile index
+__device__ __forceinline__ 
+void calculate_tile_coordinates(int tile_idx, int num_tiles_group, int group_size_m, int group_size_n, int num_blocks_m,
+                               int& tile_m, int& tile_n, int& grid_m, int& grid_n) {
+    int tile_group_idx = tile_idx / num_tiles_group;
+    int tile_in_group = tile_idx % num_tiles_group;
+    tile_m = tile_in_group % group_size_m;
+    tile_n = tile_in_group / group_size_m;
+    grid_m = tile_group_idx % (num_blocks_m / group_size_m);
+    grid_n = tile_group_idx / (num_blocks_m / group_size_m);
+}
 
 template <typename T, int PIPE, class SmemLayoutA, class SmemLayoutB, class SmemLayoutC>
 struct SharedStorage
@@ -111,12 +122,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
             
             for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x)
             {
-                int tile_group_idx = tile_idx / num_tiles_group;
-                int tile_in_group = tile_idx % num_tiles_group;
-                int tile_m = tile_in_group % group_size_m;
-                int tile_n = tile_in_group / group_size_m;
-                int group_m = tile_group_idx % (num_blocks_m / group_size_m);
-                int group_n = tile_group_idx / (num_blocks_m / group_size_m);
+                int tile_m, tile_n, group_m, group_n;
+                calculate_tile_coordinates(tile_idx, num_tiles_group, group_size_m, group_size_n, num_blocks_m,
+                                         tile_m, tile_n, group_m, group_n);
 
                 auto cta_coord = make_coord(group_m * group_size_m + tile_m, group_n * group_size_n + tile_n, _);
 
@@ -170,12 +178,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         for (int tile_idx = blockIdx.x; tile_idx < num_blocks; tile_idx+=gridDim.x)
         {
             clear(tCrC);
-            int tile_group_idx = tile_idx / num_tiles_group;
-            int tile_in_group = tile_idx % num_tiles_group;
-            int tile_m = tile_in_group % group_size_m;
-            int tile_n = tile_in_group / group_size_m;
-            int grid_m = tile_group_idx % (num_blocks_m / group_size_m);
-            int grid_n = tile_group_idx / (num_blocks_m / group_size_m);            
+            int tile_m, tile_n, grid_m, grid_n;
+            calculate_tile_coordinates(tile_idx, num_tiles_group, group_size_m, group_size_n, num_blocks_m,
+                                     tile_m, tile_n, grid_m, grid_n);
 
             auto cta_coord = make_coord(grid_m * group_size_m + tile_m, grid_n * group_size_n + tile_n, _);
             #pragma unroll 1
