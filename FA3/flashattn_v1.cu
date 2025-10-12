@@ -43,27 +43,49 @@ struct SharedStorage {
 
 // Device kernel template
 template <typename TQ, typename TK, typename TV, typename TO, 
-            class ProblemShape, class CtaTiler,
+            class CtaTiler,
             class SmemLayoutQ, class TmaQ,
             class SmemLayoutK, class TmaK,
             class SmemLayoutV, class TmaV,
-            class SmemLayoutO, class TmaO,
+            class SmemLayoutO, 
             class TiledMmaQK, class TiledMmaPV,
             int kWarps, int kWarpGroups, int kConsumerWGs, int kThreads,
             int bM, int bN, int bK, int PIPE, int cluster_M>
 __global__ static
-__launch_bounds__(kThreads)
+__launch_bounds__(kThreads, 1)
 void
-flash_attn_device(ProblemShape shape_MNK, CtaTiler cta_tiler, 
+flash_attn_device(CtaTiler cta_tiler, 
                     int num_blocks_m, int num_blocks_n,
                     TQ const* Q, CUTLASS_GRID_CONSTANT TmaQ const tma_q,
                     TK const* K, CUTLASS_GRID_CONSTANT TmaK const tma_k,
                     TV const* V, CUTLASS_GRID_CONSTANT TmaV const tma_v,
-                    TO* O, CUTLASS_GRID_CONSTANT TmaO const tma_o,
+                    TO* O,
                     TiledMmaQK mma_qk, TiledMmaPV mma_pv)
 {
-    // Implementation will go here - placeholder for now
-    // This is where the main Flash Attention computation logic would be
+    using MainloopPipeline = cutlass::PipelineTmaAsync<PIPE>;
+    using PipelineState = typename MainloopPipeline::PipelineState;
+    typename MainloopPipeline::Params params;
+
+    extern __shared__ char shared_memory[];
+    using SharedStorage = SharedStorage<PIPE, TQ, TK, TV, TO, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+    SharedStorage &smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int warp_group_idx = cutlass::canonical_warp_group_idx();
+    const int lane_predicate = cute::elect_one_sync();
+
+    if (warp_idx == 0 && lane_predicate) {
+        prefetch_tma_descriptor(tma_q.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_k.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_v.get_tma_descriptor());
+    }
+
+    params.is_leader = threadIdx.x % 128 == 0;
+    params.num_consumers = kConsumerWGs * 128;
+
+    static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<TQ> / 8);
+    static constexpr uint32_t TmaTransactionBytesk = static_cast<uint32_t>(size(take<0,2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<TQ> / 8); // faster than init a new aligned_array or array_engine
+    static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0,2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<TQ> / 8); 
 }
 
 template <class TQ, class TK, class TV, class TO, int D>
@@ -175,17 +197,17 @@ void run_flash_attn(int B, int T, int NH,
     static constexpr int NUM_PRODUCER_GROUPS = 1;
     static constexpr int NUM_CONSUMER_THREADS = NUM_CONSUMER_GROUPS * cutlass::NumThreadsPerWarp;
     static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
+    static constexpr int NUM_MMA_THREADS = size(TiledMmaQK);
 
     int num_tiles_q = cutlass::ceil_div(seq_len, bM);
     void const* kernel = reinterpret_cast<void const*>(
         &flash_attn_device<TQ, TK, TV, TO, 
-                          decltype(make_shape(seq_len, seq_len, HEAD_DIM)), 
                           decltype(TiledShape_MNK{}),
-                          decltype(SmemLayoutQ{}), decltype(tma_q),
-                          decltype(SmemLayoutK{}), decltype(tma_k),
-                          decltype(SmemLayoutV{}), decltype(tma_v),
-                          decltype(SmemLayoutO{}), decltype(tma_o),
-                          decltype(TiledMmaQK{}), decltype(TiledMmaPV{}),
+                          decltype(SmemLayoutQ), decltype(tma_q),
+                          decltype(SmemLayoutK), decltype(tma_k),
+                          decltype(SmemLayoutV), decltype(tma_v),
+                          decltype(SmemLayoutO), 
+                          decltype(TiledMmaQK), decltype(TiledMmaPV),
                           NUM_WARPS, NUM_WARPGROUPS, NUM_CONSUMER_GROUPS, NUM_THREADS,
                           bM, bN, HEAD_DIM, bP, CLUSER_M>);
 
@@ -193,12 +215,10 @@ void run_flash_attn(int B, int T, int NH,
     dim3 dimCluster(CLUSER_M, 1, 1);
     dim3 dimGrid(num_tiles_q, n_heads * batch_size);
     
-    int smem_bytes = int(sizeof(SharedStorage<TQ, bP, decltype(SmemLayoutQ{}), 
-                                            decltype(SmemLayoutK{}), 
-                                            decltype(SmemLayoutV{}), 
-                                            decltype(SmemLayoutO{})>));
+    int smem_bytes = int(sizeof(SharedStorage<bP, TQ, TK, TV, TO,
+                                            decltype(SmemLayoutQ), decltype(SmemLayoutK),
+                                            decltype(SmemLayoutV), decltype(SmemLayoutO)>));
     
-    // Set dynamic shared memory size
     CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_bytes));
@@ -210,8 +230,8 @@ void run_flash_attn(int B, int T, int NH,
                                                             Q, tma_q,
                                                             K, tma_k, 
                                                             V, tma_v,
-                                                            O, tma_o,
-                                                            TiledMmaQK{}, TiledMmaPV{});
+                                                            O, 
+                                                            TiledMmaQK, TiledMmaPV);
 }
 
 template <class TQ, class TK, class TV, class TO>
