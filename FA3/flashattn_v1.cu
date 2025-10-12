@@ -45,9 +45,13 @@ void run_flash_attn(int B, int T, int NH,
 
     auto SmemLayoutQ = tile_to_shape(SmemLayoutAtomQ, make_shape(Int<bM>{}, Int<HEAD_DIM>{}));
     auto SmemLayoutK = tile_to_shape(SmemLayoutAtomK, make_shape(Int<bN>{}, Int<HEAD_DIM>{}, Int<bP>{}));
-    auto SmemLayoutV = tile_to_shape(SmemLayoutAtomV, make_shape(Int<bN>{}, Int<HEAD_DIM>{}, Int<bP>{})); // can transpose this in view
     auto SmemLayoutO = tile_to_shape(SmemLayoutAtomQ, make_shape(Int<bM>{}, Int<HEAD_DIM>{}));
 
+    auto SmemLayoutV = SmemLayoutK;
+    auto SmemLayoutVt = cute::composition(SmemLayoutV, make_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), make_stride(Int<bN>{}, _1{}, Int<size(SmemLayoutV(_,_,_,_0{})>))));
+    // auto SmemLayoutVt = cute::composition(SmemLayoutV, make_ordered_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), Step<_2, _1, _3>{}));
+
+    Tensor mQ = make_tensor(make_gmem_ptr(Q), )
 
     using AtomLayoutMNK = Layout<Shape<Int<bM / 64>, _1, _1>>;    
 
