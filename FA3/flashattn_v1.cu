@@ -27,7 +27,7 @@ using namespace cute;
 template<bool init=false, int wg_wait=0, typename TensorA, typename TensorB, typename TensorC, typename TiledMma>
 __forceinline__ __device__ void gemm(TiledMma& mma, TensorA const& tCrA, TensorB const& tCrB, TensorC const& tCrC) {
     constexpr bool Is_RS = 
-        !cute::is_base_of<cute::GMMA:DescriptorIterator, typename TiledMma::FrgTypeA>::value;
+        !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
     if constexpr(Is_RS) {
         warpgroup_fence_operand(const_cast<TensorA&>(tCrA));
     }
