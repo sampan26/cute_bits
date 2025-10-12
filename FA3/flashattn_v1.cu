@@ -11,12 +11,15 @@
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include <cute/algorithm/copy.hpp>
+#include <cute/arch/copy_sm90.hpp>
 #include <cute/atom/copy_traits.hpp>
 #include <cute/arch/copy.hpp>
 #include "cutlass/cutlass.h"
 #include "cutlass/util/helper_cuda.hpp"
 
 using namespace cute;
+
+
 
 template <class TQ, class TK, class TV, class TO, int D>
 void run_flash_attn(int B, int T, int NH,
@@ -36,6 +39,26 @@ void run_flash_attn(int B, int T, int NH,
     static constexpr int bP = 3;
     static constexpr int CLUSER_M = 1;
 
+    static constexpr int q_head_dim_stride = 1;  // stride-1 in head dimension
+    static constexpr int q_seq_stride = HEAD_DIM;
+    int q_head_stride = HEAD_DIM * seq_len;
+    int q_batch_stride = HEAD_DIM * seq_len * n_heads;
+
+    static constexpr int k_head_dim_stride = 1;  // stride-1 in head dimension
+    static constexpr int k_seq_stride = HEAD_DIM;
+    int k_head_stride = HEAD_DIM * seq_len;
+    int k_batch_stride = HEAD_DIM * seq_len * n_heads;
+
+    static constexpr int v_head_dim_stride = 1;  // stride-1 in head dimension
+    static constexpr int v_seq_stride = HEAD_DIM;
+    int v_head_stride = HEAD_DIM * seq_len;
+    int v_batch_stride = HEAD_DIM * seq_len * n_heads;
+    
+    static constexpr int o_head_dim_stride = 1;  // stride-1 in head dimension
+    static constexpr int o_seq_stride = HEAD_DIM;
+    int o_head_stride = HEAD_DIM * seq_len;
+    int o_batch_stride = HEAD_DIM * seq_len * n_heads;
+
     using TiledShape_MNK = Shape<Int<bM>, Int<bN>, Int<HEAD_DIM>>;
 
     auto SmemLayoutAtomQ = cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, TQ, Int<bM>, Int<HEAD_DIM>>();
@@ -48,10 +71,51 @@ void run_flash_attn(int B, int T, int NH,
     auto SmemLayoutO = tile_to_shape(SmemLayoutAtomQ, make_shape(Int<bM>{}, Int<HEAD_DIM>{}));
 
     auto SmemLayoutV = SmemLayoutK;
-    auto SmemLayoutVt = cute::composition(SmemLayoutV, make_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), make_stride(Int<bN>{}, _1{}, Int<size(SmemLayoutV(_,_,_,_0{})>))));
-    // auto SmemLayoutVt = cute::composition(SmemLayoutV, make_ordered_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), Step<_2, _1, _3>{}));
+    // auto SmemLayoutVt = cute::composition(SmemLayoutV, make_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), make_stride(Int<bN>{}, _1{}, Int<size(SmemLayoutV(_,_,_,_0{})>))));
+    auto SmemLayoutVt = cute::composition(SmemLayoutV, make_ordered_layout(make_shape(Int<HEAD_DIM>{}, Int<bN>{}, Int<bP>{}), Step<_2, _1, _3>{}));
 
-    Tensor mQ = make_tensor(make_gmem_ptr(Q), )
+    auto LayoutQ = make_layout(
+        make_shape(seq_len, HEAD_DIM, n_heads, batch_size),
+        make_stride(q_seq_stride, q_head_dim_stride, q_head_stride, q_batch_stride)                                   // stride for B (batch_size)
+    );
+
+    auto LayoutK = make_layout(
+        make_shape(seq_len, HEAD_DIM, n_heads, batch_size),
+        make_stride(k_seq_stride, k_head_dim_stride, k_head_stride, k_batch_stride)                                   // stride for B (batch_size)
+    );
+
+    auto LayoutV = make_layout(
+        make_shape(seq_len, HEAD_DIM, n_heads, batch_size),
+        make_stride(v_seq_stride, v_head_dim_stride, v_head_stride, v_batch_stride)                                   // stride for B (batch_size)
+    );
+
+    Tensor mQ = make_tensor(make_gmem_ptr(Q), LayoutQ);
+    Tensor mK = make_tensor(make_gmem_ptr(K), LayoutK);
+    Tensor mV = make_tensor(make_gmem_ptr(V), LayoutV);
+
+    auto tma_q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        mQ,
+        SmemLayoutQ,
+        make_shape(Int<bM>{}, Int<HEAD_DIM>{}),
+        _1{}
+    );
+
+    auto tma_k = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        mK,
+        SmemLayoutK(_,_,_0{}),
+        make_shape(Int<bN>{}, Int<HEAD_DIM>{}),
+        _1{}
+    );
+
+    auto tma_v = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        mV,
+        SmemLayoutV(_,_,_0{}),
+        make_shape(Int<bN>{}, Int<HEAD_DIM>{}),
+        _1{}
+    );
 
     using AtomLayoutMNK = Layout<Shape<Int<bM / 64>, _1, _1>>;    
 
@@ -66,6 +130,10 @@ void run_flash_attn(int B, int T, int NH,
     static constexpr int NUM_PRODUCER_GROUPS = 1;
     static constexpr int NUM_CONSUMER_THREADS = NUM_CONSUMER_GROUPS * cutlass::NumThreadsPerWarp;
     static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
+
+    int num_tiles_q = cutlass::ceil_div(seq_len, bM);
+
+    void const* kernel = reinterpret_cast<void const*>()
 }
 
 template <class TQ, class TK, class TV, class TO>
