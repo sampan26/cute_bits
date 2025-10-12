@@ -16,10 +16,55 @@
 #include <cute/arch/copy.hpp>
 #include "cutlass/cutlass.h"
 #include "cutlass/util/helper_cuda.hpp"
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/pipeline/pipeline.hpp>
+#include <cutlass/arch/reg_reconfig.h>
+#include "cutlass/tools/util/include/cutlass/util/print_error.hpp"
 
 using namespace cute;
 
+template <int STAGES, class TQ, class TK, class TV, class TO, 
+         class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
+struct SharedStorage {
+    cute::array_aligned<TQ, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<TK, cute::cosize_v<SmemLayoutK>> smem_k;
+    union {
+        cute::array_aligned<TV, cute::cosize_v<SmemLayoutV>> smem_v;
+        cute::array_aligned<TO, cute::cosize_v<SmemLayoutO>> smem_o;
+    };
+    struct {
+        cutlass::arch::ClusterTransactionBarrier barrier_Q;
+        cutlass::arch::ClusterBarrier barrier_O;
+        typename cutlass::PipelineTmaAsync<STAGES>::SharedStorage pipeline_k;
+        typename cutlass::PipelineTmaAsync<STAGES>::SharedStorage pipeline_v;
+    };
+};
 
+// Device kernel template
+template <typename TQ, typename TK, typename TV, typename TO, 
+            class ProblemShape, class CtaTiler,
+            class SmemLayoutQ, class TmaQ,
+            class SmemLayoutK, class TmaK,
+            class SmemLayoutV, class TmaV,
+            class SmemLayoutO, class TmaO,
+            class TiledMmaQK, class TiledMmaPV,
+            int kWarps, int kWarpGroups, int kConsumerWGs, int kThreads,
+            int bM, int bN, int bK, int PIPE, int cluster_M>
+__global__ static
+__launch_bounds__(kThreads)
+void
+flash_attn_device(ProblemShape shape_MNK, CtaTiler cta_tiler, 
+                    int num_blocks_m, int num_blocks_n,
+                    TQ const* Q, CUTLASS_GRID_CONSTANT TmaQ const tma_q,
+                    TK const* K, CUTLASS_GRID_CONSTANT TmaK const tma_k,
+                    TV const* V, CUTLASS_GRID_CONSTANT TmaV const tma_v,
+                    TO* O, CUTLASS_GRID_CONSTANT TmaO const tma_o,
+                    TiledMmaQK mma_qk, TiledMmaPV mma_pv)
+{
+    // Implementation will go here - placeholder for now
+    // This is where the main Flash Attention computation logic would be
+}
 
 template <class TQ, class TK, class TV, class TO, int D>
 void run_flash_attn(int B, int T, int NH,
@@ -132,8 +177,41 @@ void run_flash_attn(int B, int T, int NH,
     static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
 
     int num_tiles_q = cutlass::ceil_div(seq_len, bM);
+    void const* kernel = reinterpret_cast<void const*>(
+        &flash_attn_device<TQ, TK, TV, TO, 
+                          decltype(make_shape(seq_len, seq_len, HEAD_DIM)), 
+                          decltype(TiledShape_MNK{}),
+                          decltype(SmemLayoutQ{}), decltype(tma_q),
+                          decltype(SmemLayoutK{}), decltype(tma_k),
+                          decltype(SmemLayoutV{}), decltype(tma_v),
+                          decltype(SmemLayoutO{}), decltype(tma_o),
+                          decltype(TiledMmaQK{}), decltype(TiledMmaPV{}),
+                          NUM_WARPS, NUM_WARPGROUPS, NUM_CONSUMER_GROUPS, NUM_THREADS,
+                          bM, bN, HEAD_DIM, bP, CLUSER_M>);
 
-    void const* kernel = reinterpret_cast<void const*>()
+    dim3 dimBlock(NUM_THREADS);
+    dim3 dimCluster(CLUSER_M, 1, 1);
+    dim3 dimGrid(num_tiles_q, n_heads * batch_size);
+    
+    int smem_bytes = int(sizeof(SharedStorage<TQ, bP, decltype(SmemLayoutQ{}), 
+                                            decltype(SmemLayoutK{}), 
+                                            decltype(SmemLayoutV{}), 
+                                            decltype(SmemLayoutO{})>));
+    
+    // Set dynamic shared memory size
+    CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes));
+
+    cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_bytes};
+    cutlass::Status status = cutlass::launch_kernel_on_cluster(params, kernel, 
+                                                            TiledShape_MNK{},
+                                                            num_tiles_q, num_tiles_q,
+                                                            Q, tma_q,
+                                                            K, tma_k, 
+                                                            V, tma_v,
+                                                            O, tma_o,
+                                                            TiledMmaQK{}, TiledMmaPV{});
 }
 
 template <class TQ, class TK, class TV, class TO>
