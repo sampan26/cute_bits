@@ -10,6 +10,7 @@
 
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cute/atom/mma_traits_sm90_gmma.hpp"
 #include <cute/algorithm/copy.hpp>
 #include <cute/arch/copy_sm90.hpp>
 #include <cute/atom/copy_traits.hpp>
@@ -25,7 +26,7 @@
 using namespace cute;
 
 template<bool init=false, int wg_wait=0, typename TensorA, typename TensorB, typename TensorC, typename TiledMma>
-__forceinline__ __device__ void gemm(TiledMma& mma, TensorA const& tCrA, TensorB const& tCrB, TensorC const& tCrC) {
+__forceinline__ __device__ void gemm(TiledMma& mma, TensorA const& tCrA, TensorB const& tCrB, TensorC& tCrC) {
     constexpr bool Is_RS = 
         !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
     if constexpr(Is_RS) {
@@ -132,7 +133,6 @@ flash_attn_device(CtaTiler cta_tiler,
 
     if (warp_idx == 0 && lane_predicate) {
         smem.barrier_Q.init(1);
-        smem.barrier_O.init(1); //cluster size
     }
 
     MainloopPipeline pipeline_k(smem.pipeline_k, params, Shape<_1, _1, _1>{});
@@ -186,8 +186,6 @@ flash_attn_device(CtaTiler cta_tiler,
                     tQgQ, tQsQ);
             }
 
-            smem.barrier_O.wait(1);
-
             if (lane_predicate) {
                 #pragma unroll2
                 for (; kv_tile_idx > 0; --kv_tile_idx) {
@@ -227,7 +225,9 @@ flash_attn_device(CtaTiler cta_tiler,
                 cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 2);
             }
         }
-
+        static constexpr int NUM_ROW_PER_THREAD = 2 * (2 * bM / kConsumerThreads);
+        using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROW_PER_THREAD>>{}));
+        TensorT score_max;
         TiledMmaQK tiled_mma_qk;
         TiledMmaPV tiled_mma_pv;
 
@@ -254,7 +254,38 @@ flash_attn_device(CtaTiler cta_tiler,
 
         pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
         cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
-        // gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS)
+        gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
+        if constexpr (kConsumerThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + (3 - warp_group_idx) /*id*/);
+        } else {
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 2 ? 3 + warp_group_idx + 1 : 3 + warp_group_idx + 1 - 3  /*id*/);
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 1 ? 3 + warp_group_idx + 2 : 3 + warp_group_idx + 2 - 3  /*id*/);
+        }
+
+        warpgroup_wait<0>();
+        pipeline_k.consumer_release(smem_pipe_read_k);
+        ++smem_pipe_read_k;
+
+        Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
+        Tensor tScS = thr_mma_qk.partition_C(cS);
+
+        for (int i = 0; i < size(tScS); ++i) {
+            int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
+            int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
+            if (kv_idx >= qo_idx + 1) {
+                tSrS(i) = -INFINITY;
+            }
+        }
+
+        {
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(tSrS); ++mi) {
+                score_max(mi) = tSrS(mi, 0);
+                // for (int ni = 0; ni < size<1>(tSrS); ++ni) {
+
+                // }
+            }
+        }
         
 
     }
