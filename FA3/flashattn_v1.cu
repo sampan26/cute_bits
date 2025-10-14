@@ -22,6 +22,7 @@
 #include <cutlass/pipeline/pipeline.hpp>
 #include <cutlass/arch/reg_reconfig.h>
 #include "cutlass/tools/util/include/cutlass/util/print_error.hpp"
+#include <cute/util/print.hpp>
 
 using namespace cute;
 
@@ -55,6 +56,54 @@ __forceinline__ __device__ void gemm(TiledMma& mma, TensorA const& tCrA, TensorB
     warpgroup_fence_operand(tCrC);
     if constexpr (Is_RS) {
         warpgroup_fence_operand(const_cast<TensorA&>(tCrA));
+    }
+}
+
+template <bool init, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1>& row_max) {
+    #pragma urnoll
+    for (int m = 0; m < size<0>(tensor); ++m) {
+        row_max(m) = init ? tensor(m, 0) : max(row_max(m), tensor(m, 0));
+
+        #pragma unroll
+        for (int n = 0; n < size<1>(tensor); ++n) {
+            row_max(m) = max(row_max(m), tensor(m, n));
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < size(row_max); ++i) {
+        float val = row_max(i);
+
+        val = max(val, __shfl_xor_sync(0xffffffff, val, 1));
+        val = max(val, __shfl_xor_sync(0xffffffff, val, 2));
+        
+        row_max(i) = val;
+    }
+}
+
+template <bool init, bool warp_reduce, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1>& row_sum) {
+    #pragma unroll
+    for (int m = 0; m < size<0>(tensor); ++m) {
+        row_sum(m) = init ? tensor(m, 0) : (row_sum(m) + tensor(m, 0));
+        
+        #pragma unroll
+        for (int n = 0; n < size<1>(tensor); ++n) {
+            sum(m) = sum(m) + tensor(m, n);
+        }
+    }
+
+    if (warp_reduce) {
+        #pragma unroll
+        for (int i = 0; i < size(row_sum); ++i) {
+            float val = row_sum(i);
+
+            val +=  __shfl_xor_sync(0xfffffff, val, 1);
+            val +=  __shfl_xor_sync(0xfffffff, val, 2);
+
+            row_sum(i) = val;
+        }
     }
 }
 
@@ -95,204 +144,245 @@ flash_attn_device(CtaTiler cta_tiler,
                     TK const* K, CUTLASS_GRID_CONSTANT TmaK const tma_k,
                     TV const* V, CUTLASS_GRID_CONSTANT TmaV const tma_v,
                     TO* O, 
-                    int bs, int seq_len, int NUM_HEADS, int head_dim)
+                    int bs, int seq_len, int NUM_HEADS, int head_dim, float scale)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
-        printf(tSrS);
+    const int q_tile_idx = blockIdx.x;
+    const int batch_head_idx = blockIdx.y;
+    const int batch_idx = batch_head_idx / NUM_HEADS;
+    const int head_idx = batch_head_idx % NUM_HEADS;
+    const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(cta_tiler), get<1>(cta_tiler));
+
+    using MainloopPipeline = cutlass::PipelineTmaAsync<PIPE>;
+    using PipelineState = typename MainloopPipeline::PipelineState;
+    typename MainloopPipeline::Params params;
+
+    extern __shared__ char shared_memory[];
+    using SharedStorage = SharedStorage<PIPE, TQ, TK, TV, TO, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+    SharedStorage &smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int warp_group_idx = cutlass::canonical_warp_group_idx();
+    const int lane_predicate = cute::elect_one_sync();
+
+    if (warp_idx == 0 && lane_predicate) {
+        prefetch_tma_descriptor(tma_q.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_k.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_v.get_tma_descriptor());
     }
-    // const int q_tile_idx = blockIdx.x;
-    // const int batch_head_idx = blockIdx.y;
-    // const int batch_idx = batch_head_idx / NUM_HEADS;
-    // const int head_idx = batch_head_idx % NUM_HEADS;
-    // const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(cta_tiler), get<1>(cta_tiler));
 
-    // using MainloopPipeline = cutlass::PipelineTmaAsync<PIPE>;
-    // using PipelineState = typename MainloopPipeline::PipelineState;
-    // typename MainloopPipeline::Params params;
+    params.is_leader = threadIdx.x % 128 == 0;
+    params.num_consumers = kConsumerThreads;
+    params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
 
-    // extern __shared__ char shared_memory[];
-    // using SharedStorage = SharedStorage<PIPE, TQ, TK, TV, TO, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
-    // SharedStorage &smem = *reinterpret_cast<SharedStorage*>(shared_memory);
+    static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<TQ> / 8);
+    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0,2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<TQ> / 8); // faster than init a new aligned_array or array_engine
+    static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0,2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<TQ> / 8); 
 
-    // const int warp_idx = cutlass::canonical_warp_idx_sync();
-    // const int warp_group_idx = cutlass::canonical_warp_group_idx();
-    // const int lane_predicate = cute::elect_one_sync();
+    params.transaction_bytes = TmaTransactionBytesK;
 
-    // if (warp_idx == 0 && lane_predicate) {
-    //     prefetch_tma_descriptor(tma_q.get_tma_descriptor());
-    //     prefetch_tma_descriptor(tma_k.get_tma_descriptor());
-    //     prefetch_tma_descriptor(tma_v.get_tma_descriptor());
-    // }
+    if (warp_idx == 0 && lane_predicate) {
+        smem.barrier_Q.init(1);
+    }
 
-    // params.is_leader = threadIdx.x % 128 == 0;
-    // params.num_consumers = kConsumerThreads;
-    // params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
+    MainloopPipeline pipeline_k(smem.pipeline_k, params, Shape<_1, _1, _1>{});
+    MainloopPipeline pipeline_v(smem.pipeline_v, params, Shape<_1, _1, _1>{});
 
-    // static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<TQ> / 8);
-    // static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0,2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<TQ> / 8); // faster than init a new aligned_array or array_engine
-    // static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0,2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<TQ> / 8); 
+    __syncthreads();
 
-    // params.transaction_bytes = TmaTransactionBytesK;
+    if (warp_group_idx == 0) {
+        cutlass::arch::warpgroup_reg_dealloc<24>();
 
-    // if (warp_idx == 0 && lane_predicate) {
-    //     smem.barrier_Q.init(1);
-    // }
+        int warp_idx_in_wg = __shfl_sync(0xfffffff, (threadIdx.x / 32) % 4, 0);
+        if (warp_idx_in_wg == 0) {
+            PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
+            PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
-    // MainloopPipeline pipeline_k(smem.pipeline_k, params, Shape<_1, _1, _1>{});
-    // MainloopPipeline pipeline_v(smem.pipeline_v, params, Shape<_1, _1, _1>{});
+            Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.data()), SmemLayoutQ{});
+            Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.data()), SmemLayoutK{});
+            Tensor sV = make_tensor(make_smem_ptr(smem.smem_v.data()), SmemLayoutV{});
 
-    // __syncthreads();
+            Tensor mQ = tma_q.get_tma_tensor(LayoutQ{}.shape());
+            Tensor mK = tma_k.get_tma_tensor(LayoutK{}.shape());
+            Tensor mV = tma_v.get_tma_tensor(LayoutV{}.shape());
 
-    // if (warp_group_idx == 0) {
-    //     cutlass::arch::warpgroup_reg_dealloc<24>();
+            Tensor gQ = local_tile(mQ(_, _, head_idx, batch_idx), select<0, 2>(cta_tiler), make_coord(q_tile_idx, _0{}));
+            Tensor gK = local_tile(mK(_, _, head_idx, batch_idx), select<1, 2>(cta_tiler), make_coord(_, _0{}));
+            Tensor gV = local_tile(mV(_, _, head_idx, batch_idx), select<2, 2>(cta_tiler), make_coord(_, _0{}));
 
-    //     int warp_idx_in_wg = __shfl_sync(0xfffffff, (threadIdx.x / 32) % 4, 0);
-    //     if (warp_idx_in_wg == 0) {
-    //         PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-    //         PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+            Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
+            Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
 
-    //         Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.data()), SmemLayoutQ{});
-    //         Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.data()), SmemLayoutK{});
-    //         Tensor sV = make_tensor(make_smem_ptr(smem.smem_v.data()), SmemLayoutV{});
+            auto [tQgQ, tQsQ] = tma_partition(tma_q, _0{}, Layout<_1>{}, group_modes<0,2>(sQ_x), group_modes<0,2>(gQ_x));
+            auto [tKgK, tKsK] = tma_partition(tma_k, _0{}, Layout<_1>{}, group_modes<0,2>(sK), group_modes<0,2>(gK));
+            auto [tVgV, tVsV] = tma_partition(tma_v, _0{}, Layout<_1>{}, group_modes<0,2>(sV), group_modes<0,2>(gV));
 
-    //         Tensor mQ = tma_q.get_tma_tensor(LayoutQ{}.shape());
-    //         Tensor mK = tma_k.get_tma_tensor(LayoutK{}.shape());
-    //         Tensor mV = tma_v.get_tma_tensor(LayoutV{}.shape());
+            int kv_tile_idx = num_kv_tiles - 1;
 
-    //         Tensor gQ = local_tile(mQ(_, _, head_idx, batch_idx), select<0, 2>(cta_tiler), make_coord(q_tile_idx, _0{}));
-    //         Tensor gK = local_tile(mK(_, _, head_idx, batch_idx), select<1, 2>(cta_tiler), make_coord(_, _0{}));
-    //         Tensor gV = local_tile(mV(_, _, head_idx, batch_idx), select<2, 2>(cta_tiler), make_coord(_, _0{}));
+            int lane_predicate = cute::elect_one_sync();
+            if (lane_predicate) {
+                pipeline_k.producer_acquire(smem_pipe_write_k);
+                copy(tma_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
+                    tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
+                ++smem_pipe_write_k;
+            }
 
-    //         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
-    //         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
 
-    //         auto [tQgQ, tQsQ] = tma_partition(tma_q, _0{}, Layout<_1>{}, group_modes<0,2>(sQ_x), group_modes<0,2>(gQ_x));
-    //         auto [tKgK, tKsK] = tma_partition(tma_k, _0{}, Layout<_1>{}, group_modes<0,2>(sK), group_modes<0,2>(gK));
-    //         auto [tVgV, tVsV] = tma_partition(tma_v, _0{}, Layout<_1>{}, group_modes<0,2>(sV), group_modes<0,2>(gV));
+            if (lane_predicate) {
+                smem.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+                copy(tma_q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                    smem.barrier_Q), 0),
+                    tQgQ, tQsQ);
+            }
 
-    //         int kv_tile_idx = num_kv_tiles - 1;
+            if (lane_predicate) {
+                #pragma unroll2
+                for (; kv_tile_idx > 0; --kv_tile_idx) {
+                    pipeline_k.producer_acquire(smem_pipe_write_k);
+                    copy(tma_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
+                         tKgK(_, kv_tile_idx-1), tKsK(_, smem_pipe_write_k.index()));
+                    ++smem_pipe_write_k;
+                    pipeline_v.producer_acquire(smem_pipe_write_v);
+                    copy(tma_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
+                         tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+                    ++smem_pipe_write_v;
+                }
+            }
+            if (lane_predicate) {
+                pipeline_v.producer_acquire(smem_pipe_write_v);
+                    copy(tma_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
+                         tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+                    ++smem_pipe_write_v;
+            }
 
-    //         int lane_predicate = cute::elect_one_sync();
-    //         if (lane_predicate) {
-    //             pipeline_k.producer_acquire(smem_pipe_write_k);
-    //             copy(tma_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
-    //                 tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
-    //             ++smem_pipe_write_k;
-    //         }
+            if (warp_idx_in_wg == 0 && lane_predicate) {
+                pipeline_k.producer_tail(smem_pipe_write_k);
+                pipeline_v.producer_tail(smem_pipe_write_v);
+            }
+        }
+    } else {
+        cutlass::arch::warpgroup_reg_alloc<240>();
+        const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
+        PipelineState smem_pipe_read_k, smem_pipe_read_v;
 
-    //         cutlass::arch::NamedBarrier::sync(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
+        cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
+        // if (warp_group_idx > 1) {
+        //     cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 1);
+        // }
+        // if constexpr (kConsumerThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
+        //     if (warp_group_idx > 2) {
+        //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 2);
+        //     }
+        // }
+        static constexpr int NUM_ROW_PER_THREAD = 2 * (2 * bM / kConsumerThreads); // 2
+        using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROW_PER_THREAD>>{}));
+        TensorT score_max, score_sum, score_scale;
+        TiledMmaQK tiled_mma_qk;
+        TiledMmaPV tiled_mma_pv;
 
-    //         if (lane_predicate) {
-    //             smem.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-    //             copy(tma_q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-    //                 smem.barrier_Q), 0),
-    //                 tQgQ, tQsQ);
-    //         }
+        Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.data()), SmemLayoutQ{});
+        Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.data()), SmemLayoutK{});
+        Tensor sVt = make_tensor(make_smem_ptr(smem.smem_v.data()), SmemLayoutVt{});
 
-    //         if (lane_predicate) {
-    //             #pragma unroll2
-    //             for (; kv_tile_idx > 0; --kv_tile_idx) {
-    //                 pipeline_k.producer_acquire(smem_pipe_write_k);
-    //                 copy(tma_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
-    //                      tKgK(_, kv_tile_idx-1), tKsK(_, smem_pipe_write_k.index()));
-    //                 ++smem_pipe_write_k;
-    //                 pipeline_v.producer_acquire(smem_pipe_write_v);
-    //                 copy(tma_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
-    //                      tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-    //                 ++smem_pipe_write_v;
-    //             }
-    //         }
-    //         if (lane_predicate) {
-    //             pipeline_v.producer_acquire(smem_pipe_write_v);
-    //                 copy(tma_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
-    //                      tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-    //                 ++smem_pipe_write_v;
-    //         }
+        auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
+        auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
 
-    //         if (warp_idx_in_wg == 0 && lane_predicate) {
-    //             pipeline_k.producer_tail(smem_pipe_write_k);
-    //             pipeline_v.producer_tail(smem_pipe_write_v);
-    //         }
-    //     }
-    // } else {
-    //     cutlass::arch::warpgroup_reg_alloc<240>();
-    //     const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
-    //     PipelineState smem_pipe_read_k, smem_pipe_read_v;
+        Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
+        Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
+        Tensor tOrV = thr_mma_pv.partition_fragment_B(sVt);
+        Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
+        Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0,2>(cta_tiler));
 
-    //     cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
-    //     if (warp_group_idx > 1) {
-    //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 1);
-    //     }
-    //     if constexpr (kConsumerThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
-    //         if (warp_group_idx > 2) {
-    //             cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 2);
-    //         }
-    //     }
-    //     static constexpr int NUM_ROW_PER_THREAD = 2 * (2 * bM / kConsumerThreads);
-    //     using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROW_PER_THREAD>>{}));
-    //     TensorT score_max;
-    //     TiledMmaQK tiled_mma_qk;
-    //     TiledMmaPV tiled_mma_pv;
+        tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
+        int kv_tile_idx = num_kv_tiles - 1; 
 
-    //     Tensor sQ = make_tensor(make_smem_ptr(smem.smem_q.data()), SmemLayoutQ{});
-    //     Tensor sK = make_tensor(make_smem_ptr(smem.smem_k.data()), SmemLayoutK{});
-    //     Tensor sVt = make_tensor(make_smem_ptr(smem.smem_v.data()), SmemLayoutVt{});
+        cutlass::ConsumerToken token = static_cast<cutlass::BarrierStatus>(smem.barrier_Q.try_wait(0));
+        if (token == cutlass::BarrierStatus::WaitAgain) {
+            smem.barrier_Q.wait(0);
+        }
 
-    //     auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
-    //     auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
+        pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
+        cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+        gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
+        if constexpr (kConsumerThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + (3 - warp_group_idx) /*id*/);
+        } else {
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 2 ? 3 + warp_group_idx + 1 : 3 + warp_group_idx + 1 - 3  /*id*/);
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 1 ? 3 + warp_group_idx + 2 : 3 + warp_group_idx + 2 - 3  /*id*/);
+        }
 
-    //     Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
-    //     Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
-    //     Tensor tOrV = thr_mma_pv.partition_fragment_B(sVt);
-    //     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
-    //     Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0,2>(cta_tiler));
+        warpgroup_wait<0>();
+        pipeline_k.consumer_release(smem_pipe_read_k);
+        ++smem_pipe_read_k;
 
-    //     tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
-    //     int kv_tile_idx = num_kv_tiles - 1; 
+        Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
+        Tensor tScS = thr_mma_qk.partition_C(cS);
 
-    //     cutlass::ConsumerToken token = static_cast<cutlass::BarrierStatus>(smem.barrier_Q.try_wait(0));
-    //     if (token == cutlass::BarrierStatus::WaitAgain) {
-    //         smem.barrier_Q.wait(0);
-    //     }
+        for (int i = 0; i < size(tScS); ++i) {
+            int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
+            int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
+            if (kv_idx >= qo_idx + 1) {
+                tSrS(i) = -INFINITY;
+            }
+        }
 
-    //     pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
-    //     cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
-    //     gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
-    //     if constexpr (kConsumerThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
-    //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + (3 - warp_group_idx) /*id*/);
-    //     } else {
-    //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 2 ? 3 + warp_group_idx + 1 : 3 + warp_group_idx + 1 - 3  /*id*/);
-    //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 1 ? 3 + warp_group_idx + 2 : 3 + warp_group_idx + 2 - 3  /*id*/);
-    //     }
+        Layout acc_row_layout = make_layout(
+            make_layout(get<0,0>(tSrS.layout()), get<1>(tSrS.layout())),
+            make_layout(get<0,1>(tSrS.layout()), get<0,2>(tSrS.layout()), get<2>(tSrS.layout()))
+        );
+        Tensor scores = make_tensor(tSrS.data(), acc_row_layout);    
 
-    //     warpgroup_wait<0>();
-    //     pipeline_k.consumer_release(smem_pipe_read_k);
-    //     ++smem_pipe_read_k;
+        reduce_max<true>(scores, score_max);
+        #pragma unroll
+        for (int m = 0; m < size<0>(scores); ++m) {
+            auto row_max = score_max(m);
+            #pragma unroll
+            for (int n = 0; n < size<0>(scores); ++n) {
+                scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
+            }
+        }
+        reduce_sum<true, false>(scores, score_sum);
 
-    //     Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
-    //     Tensor tScS = thr_mma_qk.partition_C(cS);
+        // Tensor tOrP = 
+        clear(score_scale);
+        constexpr int n_masking_steps = bM / bN + 1;
+        for (int mask_step = 0; mask_step < n_masking_steps, kv_tile_idx > 0; ++mask_step, --kv_tile_idx) {
+            Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
+            pipeline_k.consumer_wait(pipeline_k.consumer_try_wait(smem_pipe_read_k));
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+            gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
 
-    //     for (int i = 0; i < size(tScS); ++i) {
-    //         int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
-    //         int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
-    //         if (kv_idx >= qo_idx + 1) {
-    //             tSrS(i) = -INFINITY;
-    //         }
-    //     }
+            if (mask_step > 0) {
+                Tensor scores = make_tensor(tSrS.data(), acc_row_layout);    
+                #pragma unroll
+                for (int m = 0; m < size(score_max); ++m) {
+                    #pragma unroll 
+                    for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+                        scores(m, n) *= score_scale(m);
+                    }
+                }
+            }
 
-    //     {
-    //         #pragma unroll
-    //         for (int mi = 0; mi < size<0>(tSrS); ++mi) {
-    //             score_max(mi) = tSrS(mi, 0);
-    //             // for (int ni = 0; ni < size<1>(tSrS); ++ni) {
+            pipeline_v.consumer_wait(pipeline_v.consumer_try_wait(smem_pipe_read_v));
+            gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+            warpgroup_wait<1>();
+            pipeline_k.consumer_release(smem_pipe_read_k);
+            Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
+            Tensor tScS = thr_mma_qk.partition_C(cS);
 
-    //             // }
-    //         }
-    //     }
-        
+            #pragma unroll
+            for (int i = 0; i < size(tScS); ++i) {
+                int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
+                int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
+                if (kv_idx >= qo_idx + 1) {
+                    tSrS(i) = -INFINITY;
+                }
+            } 
 
-    // }
+
+        }
+    }
 }
 
 template <class TQ, class TK, class TV, class TO, int D>
@@ -307,7 +397,7 @@ void run_flash_attn(int B, int T, int NH,
     auto seq_len = int(T);
     auto n_heads = int(NH);
 
-    static constexpr int bM = 256;
+    static constexpr int bM = 128;
     static constexpr int bN = 128;
     static constexpr int HEAD_DIM = D;
     static constexpr int bP = 3;
@@ -317,6 +407,8 @@ void run_flash_attn(int B, int T, int NH,
     static constexpr int q_seq_stride = HEAD_DIM;
     int q_head_stride = HEAD_DIM * seq_len;
     int q_batch_stride = HEAD_DIM * seq_len * n_heads;
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
 
     static constexpr int k_head_dim_stride = 1;  // stride-1 in head dimension
     static constexpr int k_seq_stride = HEAD_DIM;
@@ -436,7 +528,8 @@ void run_flash_attn(int B, int T, int NH,
                                                             K, tma_k, 
                                                             V, tma_v,
                                                             O, 
-                                                            batch_size, seq_len, n_heads, HEAD_DIM);
+                                                            batch_size, seq_len, n_heads, HEAD_DIM,
+                                                            scale);
 }
 
 template <class TQ, class TK, class TV, class TO>
