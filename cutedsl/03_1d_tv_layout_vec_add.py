@@ -28,15 +28,15 @@ def elementwise_add_kernel(
     thrC[None] = thrA.load() + thrB.load()
 
 @cute.jit
-def solution(d_input1: cute.Tensor, d_input2: cute.Tensor, d_output: cute.Tensor, n: cute.Int32):
+def vec_add(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, n: cute.Int32):
     thr_layout = cute.make_layout(shape=(512), stride=(1))
     val_layout = cute.group_modes(cute.make_layout(shape=(4,4), stride=(4,1)), 0, 1)
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
     tiler_1d = cute.group_modes((cute.size(tiler_mn)), 0, 1)
 
-    gA = cute.zipped_divide(d_input1, tiler_1d)
-    gB = cute.zipped_divide(d_input2, tiler_1d)
-    gC = cute.zipped_divide(d_output, tiler_1d)
+    gA = cute.zipped_divide(A, tiler_1d)
+    gB = cute.zipped_divide(B, tiler_1d)
+    gC = cute.zipped_divide(C, tiler_1d)
 
     elementwise_add_kernel(
         gA, gB, gC, tv_layout
