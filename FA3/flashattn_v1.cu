@@ -343,17 +343,27 @@ flash_attn_device(CtaTiler cta_tiler,
         }
         reduce_sum<true, false>(scores, score_sum);
 
-        // Tensor tOrP = 
+        cutlass::NumericArrayConverter<TK, float, decltype(size(tSrS))::value, cutlass::FloatRoundStyle::round_to_nearest> convert_op;
+        auto frag = convert_op(*reinterpret_cast<const cutlass::Array<float, decltype(size(tSrS))::value>*>(tSrS.data()));
+        Tensor tSrS_bf16 = make_tensor(make_rmem_ptr<TK>(&frag), tSrS.layout());  // Changed from tScS.layout()
+        auto l = logical_divide(get<0>(tSrS.layout()), Shape<Underscore, Underscore, _2>{});
+        Layout tOrP_layout = make_layout(
+            make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(tSrS.layout()),
+            make_layout(get<2,1>(l), get<2>(tSrS.layout()))
+        );
+
+        Tensor tOrP = make_tensor(tSrS_bf16.data(), tOrP_layout);
+
         clear(score_scale);
         constexpr int n_masking_steps = bM / bN + 1;
         for (int mask_step = 0; mask_step < n_masking_steps, kv_tile_idx > 0; ++mask_step, --kv_tile_idx) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
             pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
-            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + (3-warp_group_idx));
             gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
 
             if (mask_step > 0) {
-                Tensor scores = make_tensor(tSrS.data(), acc_row_layout);    
+                Tensor scores = make_tensor(tOrO.data(), acc_row_layout);    
                 #pragma unroll
                 for (int m = 0; m < size(score_max); ++m) {
                     #pragma unroll 
@@ -364,25 +374,154 @@ flash_attn_device(CtaTiler cta_tiler,
             }
 
             pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
-            // gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-            // cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
-            // warpgroup_wait<1>();
-            // pipeline_k.consumer_release(smem_pipe_read_k);
-            // Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
-            // Tensor tScS = thr_mma_qk.partition_C(cS);
+            gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+            if constexpr (kConsumerThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + (3 - warp_group_idx) /*id*/);
+            } else {
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 2 ? 3 + warp_group_idx + 1 : 3 + warp_group_idx + 1 - 3  /*id*/);
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 1 ? 3 + warp_group_idx + 2 : 3 + warp_group_idx + 2 - 3  /*id*/);
+            }
+            warpgroup_wait<1>();
+            pipeline_k.consumer_release(smem_pipe_read_k);
+            Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
+            Tensor tScS = thr_mma_qk.partition_C(cS);
 
-            // #pragma unroll
-            // for (int i = 0; i < size(tScS); ++i) {
-            //     int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
-            //     int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
-            //     if (kv_idx >= qo_idx + 1) {
-            //         tSrS(i) = -INFINITY;
-            //     }
-            // } 
+            #pragma unroll
+            for (int i = 0; i < size(tScS); ++i) {
+                int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
+                int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
+                if (kv_idx >= qo_idx + 1) {
+                    tSrS(i) = -INFINITY;
+                }
+            } 
+            Tensor scores = make_tensor(tSrS.data(), acc_row_layout);
+            Tensor score_max_prev = make_fragment_like(score_max);
+            cute::copy(score_max, score_max_prev);
+            reduce_max<false>(scores, score_max);
 
+            #pragma unroll
+            for (int m = 0; m < size(score_max); ++m) {
+                float score_max_cur = score_max(m);
+                score_scale(m) = exp2f((score_max_prev(m) - score_max_cur) * scale);
+                score_sum(m) *= score_scale(m);
+            }
 
+            #pragma unroll
+            for (int m = 0; m < size<0>(scores); ++m) {
+                auto row_max = score_max(m);
+                #pragma unroll
+                for (int n = 0; n < size<0>(scores); ++n) {
+                    scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
+                }
+            }
+            reduce_sum<false, false>(scores, score_sum);
+            warpgroup_wait<0>();
+            pipeline_v.consumer_release(smem_pipe_read_v);
+            ++smem_pipe_read_k;
+            ++smem_pipe_read_v;
+            
+            auto frag = convert_op(*reinterpret_cast<const cutlass::Array<float, decltype(size(tSrS))::value>*>(tSrS.data()));
+            Tensor tSrS_bf16 = make_tensor(make_rmem_ptr<TK>(&frag), tSrS.layout());  // Changed from tScS.layout()
+            auto l = logical_divide(get<0>(tSrS.layout()), Shape<Underscore, Underscore, _2>{});
+            Layout tOrP_layout = make_layout(
+                make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(tSrS.layout()),
+                make_layout(get<2,1>(l), get<2>(tSrS.layout()))
+            );
+            
+            cute::copy(make_tensor(tSrS_bf16.data(), tOrP_layout), tOrP);
+            
+        }
+
+        for (; kv_tile_idx > 0; --kv_tile_idx) {
+            Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
+            pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+            gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
+
+            Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
+            #pragma unroll
+            for (int m = 0; m < size(score_max); ++m) {
+                #pragma unroll 
+                for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+                    scores(m, n) *= score_scale(m);
+                }
+            }
+
+            pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
+            gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+            if constexpr (kConsumerThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + (3 - warp_group_idx) /*id*/);
+            } else {
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 2 ? 3 + warp_group_idx + 1 : 3 + warp_group_idx + 1 - 3  /*id*/);
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, warp_group_idx <= 1 ? 3 + warp_group_idx + 2 : 3 + warp_group_idx + 2 - 3  /*id*/);
+            }
+            warpgroup_wait<1>();
+            pipeline_k.consumer_release(smem_pipe_read_k);
+
+            Tensor scores = make_tensor(tSrS.data(), acc_row_layout);
+            Tensor score_max_prev = make_fragment_like(score_max);
+            cute::copy(score_max, score_max_prev);
+            reduce_max<false>(scores, score_max);
+
+            #pragma unroll
+            for (int m = 0; m < size(score_max); ++m) {
+                float score_max_cur = score_max(m);
+                score_scale(m) = exp2f((score_max_prev(m) - score_max_cur) * scale);
+                score_sum(m) *= score_scale(m);
+            }
+
+            #pragma unroll
+            for (int m = 0; m < size<0>(scores); ++m) {
+                auto row_max = score_max(m);
+                #pragma unroll
+                for (int n = 0; n < size<0>(scores); ++n) {
+                    scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
+                }
+            }
+            reduce_sum<false, false>(scores, score_sum);
+
+            warpgroup_wait<0>();
+            pipeline_v.consumer_release(smem_pipe_read_v);
+            ++smem_pipe_read_k;
+            ++smem_pipe_read_v;
+            
+            auto frag = convert_op(*reinterpret_cast<const cutlass::Array<float, decltype(size(tSrS))::value>*>(tSrS.data()));
+            Tensor tSrS_bf16 = make_tensor(make_rmem_ptr<TK>(&frag), tSrS.layout());  // Changed from tScS.layout()
+            auto l = logical_divide(get<0>(tSrS.layout()), Shape<Underscore, Underscore, _2>{});
+            Layout tOrP_layout = make_layout(
+                make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(tSrS.layout()),
+                make_layout(get<2,1>(l), get<2>(tSrS.layout()))
+            );
+            
+            cute::copy(make_tensor(tSrS_bf16.data(), tOrP_layout), tOrP);
         }
     }
+
+    cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
+    Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
+    #pragma unroll
+    for (int m = 0; m < size(score_max); ++m) {
+        #pragma unroll 
+        for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+            scores(m, n) *= score_scale(m);
+        }
+    }
+    pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
+    gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+    finalize(tSrS);
+
+    warpgroup_wait<0>();
+    pipeline_v.consumer_release(smem_pipe_read_v);
+    ++smem_pipe_read_v;
+    Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
+    #pragma unroll
+    for (int m = 0; m < size(score_max); ++m) {
+        #pragma unroll 
+        for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+            scores(m, n) *= score_scale(m);
+        }
+    }
+    return;
 }
 
 template <class TQ, class TK, class TV, class TO, int D>
@@ -486,8 +625,9 @@ void run_flash_attn(int B, int T, int NH,
     using AtomLayoutMNK = Layout<Shape<Int<bM / 64>, _1, _1>>;    
 
     using TiledMmaQK = decltype(make_tiled_mma(GMMA::ss_op_selector<TQ, TK, float, TiledShape_MNK>(), AtomLayoutMNK{}));
-    using TiledMmaPV = decltype(make_tiled_mma(GMMA::ss_op_selector<TK, TV, float, TiledShape_MNK, GMMA::Major::K, GMMA::Major::MN>(), 
-                                        AtomLayoutMNK{}));
+    using TiledMmaPV = decltype(make_tiled_mma(
+        GMMA::rs_op_selector<TK, TV, float, TiledShape_MNK, GMMA::Major::K, GMMA::Major::MN>(), 
+        AtomLayoutMNK{}));
     
     static constexpr int NUM_WARPS = ((bM / 64) + 1) * 4;
     static constexpr int NUM_THREADS = NUM_WARPS * 32;
