@@ -90,7 +90,7 @@ __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const &tenso
         
         #pragma unroll
         for (int n = 0; n < size<1>(tensor); ++n) {
-            sum(m) = sum(m) + tensor(m, n);
+            row_sum(m) = row_sum(m) + tensor(m, n);
         }
     }
 
@@ -266,14 +266,14 @@ flash_attn_device(CtaTiler cta_tiler,
         PipelineState smem_pipe_read_k, smem_pipe_read_v;
 
         cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
-        // if (warp_group_idx > 1) {
-        //     cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 1);
-        // }
-        // if constexpr (kConsumerThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
-        //     if (warp_group_idx > 2) {
-        //         cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 2);
-        //     }
-        // }
+        if (warp_group_idx > 1) {
+            cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 1);
+        }
+        if constexpr (kConsumerThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
+            if (warp_group_idx > 2) {
+                cutlass::arch::NamedBarrier::arrive(kConsumerThreads, 3 + 2);
+            }
+        }
         static constexpr int NUM_ROW_PER_THREAD = 2 * (2 * bM / kConsumerThreads); // 2
         using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROW_PER_THREAD>>{}));
         TensorT score_max, score_sum, score_scale;
@@ -348,7 +348,7 @@ flash_attn_device(CtaTiler cta_tiler,
         constexpr int n_masking_steps = bM / bN + 1;
         for (int mask_step = 0; mask_step < n_masking_steps, kv_tile_idx > 0; ++mask_step, --kv_tile_idx) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
-            pipeline_k.consumer_wait(pipeline_k.consumer_try_wait(smem_pipe_read_k));
+            pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
             cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
             gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
 
@@ -363,22 +363,22 @@ flash_attn_device(CtaTiler cta_tiler,
                 }
             }
 
-            pipeline_v.consumer_wait(pipeline_v.consumer_try_wait(smem_pipe_read_v));
-            gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
-            warpgroup_wait<1>();
-            pipeline_k.consumer_release(smem_pipe_read_k);
-            Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
-            Tensor tScS = thr_mma_qk.partition_C(cS);
+            pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
+            // gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+            // cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
+            // warpgroup_wait<1>();
+            // pipeline_k.consumer_release(smem_pipe_read_k);
+            // Tensor cS = make_identity_tensor(select<0,1>(cta_tiler));
+            // Tensor tScS = thr_mma_qk.partition_C(cS);
 
-            #pragma unroll
-            for (int i = 0; i < size(tScS); ++i) {
-                int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
-                int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
-                if (kv_idx >= qo_idx + 1) {
-                    tSrS(i) = -INFINITY;
-                }
-            } 
+            // #pragma unroll
+            // for (int i = 0; i < size(tScS); ++i) {
+            //     int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
+            //     int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
+            //     if (kv_idx >= qo_idx + 1) {
+            //         tSrS(i) = -INFINITY;
+            //     }
+            // } 
 
 
         }
