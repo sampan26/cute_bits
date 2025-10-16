@@ -2,9 +2,6 @@
 #include <cstdio>
 #include <cassert>
 
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
@@ -130,11 +127,13 @@ struct SharedStorage {
 // Device kernel template
 template <typename TQ, typename TK, typename TV, typename TO, 
             class CtaTiler,
-            class LayoutQ, class LayoutK, class LayoutV,
+            class LayoutQ, class LayoutK, class LayoutV, class LayoutO,
             class SmemLayoutQ, class TmaQ,
             class SmemLayoutK, class TmaK,
             class SmemLayoutV, class TmaV,
-            class SmemLayoutVt, class SmemLayoutO, 
+            class SmemLayoutVt, 
+            class SmemLayoutO, class TmaO,
+            class SmemCopyAtomO,
             class TiledMmaQK, class TiledMmaPV,
             int kWarps, int kWarpGroups, int kConsumerThreads, int kThreads,
             int bM, int bN, int bK, int PIPE, int cluster_M>
@@ -146,7 +145,7 @@ flash_attn_device(CtaTiler cta_tiler,
                     TQ const* Q, CUTLASS_GRID_CONSTANT TmaQ const tma_q,
                     TK const* K, CUTLASS_GRID_CONSTANT TmaK const tma_k,
                     TV const* V, CUTLASS_GRID_CONSTANT TmaV const tma_v,
-                    TO* O, 
+                    TO* O, CUTLASS_GRID_CONSTANT TmaO const tma_o,
                     int bs, int seq_len, int NUM_HEADS, int head_dim, float scale)
 {
     const int q_tile_idx = blockIdx.x;
@@ -461,7 +460,7 @@ flash_attn_device(CtaTiler cta_tiler,
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);
 
-            Tensor scores = make_tensor(tSrS.data(), acc_row_layout);
+            scores = make_tensor(tSrS.data(), acc_row_layout);
             Tensor score_max_prev = make_fragment_like(score_max);
             cute::copy(score_max, score_max_prev);
             reduce_max<false>(scores, score_max);
@@ -489,7 +488,7 @@ flash_attn_device(CtaTiler cta_tiler,
             ++smem_pipe_read_v;
             
             auto frag = convert_op(*reinterpret_cast<const cutlass::Array<float, decltype(size(tSrS))::value>*>(tSrS.data()));
-            Tensor tSrS_bf16 = make_tensor(make_rmem_ptr<TK>(&frag), tSrS.layout());  // Changed from tScS.layout()
+            Tensor tSrS_bf16 = make_tensor(make_rmem_ptr<TK>(&frag), tSrS.layout());
             auto l = logical_divide(get<0>(tSrS.layout()), Shape<Underscore, Underscore, _2>{});
             Layout tOrP_layout = make_layout(
                 make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(tSrS.layout()),
@@ -498,34 +497,71 @@ flash_attn_device(CtaTiler cta_tiler,
             
             cute::copy(make_tensor(tSrS_bf16.data(), tOrP_layout), tOrP);
         }
-    }
 
-    cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
-    Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
-    #pragma unroll
-    for (int m = 0; m < size(score_max); ++m) {
-        #pragma unroll 
-        for (int n = 0; n < size<1>(acc_row_layout); ++n) {
-            scores(m, n) *= score_scale(m);
+        // ADD THE FINAL SECTION HERE (BEFORE THE CLOSING BRACE OF THE ELSE BLOCK):
+        cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
+        scores = make_tensor(tOrO.data(), acc_row_layout); 
+        #pragma unroll
+        for (int m = 0; m < size(score_max); ++m) {
+            #pragma unroll 
+            for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+                scores(m, n) *= score_scale(m);
+            }
         }
-    }
-    pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
-    gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-    finalize(tSrS);
+        pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
+        gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+        
+        warpgroup_wait<0>();
+        pipeline_v.consumer_release(smem_pipe_read_v);
+        ++smem_pipe_read_v;
+        
+        scores = make_tensor(tOrO.data(), acc_row_layout); 
+        #pragma unroll
+        for (int m = 0; m < size(score_max); ++m) {
+            #pragma unroll 
+            for (int n = 0; n < size<1>(acc_row_layout); ++n) {
+                scores(m, n) /= score_sum(m);  // Final normalization
+            }
+        }
+        //epilogue store
+        {
+            Tensor sO = make_tensor(make_smem_ptr(smem.smem_o.data()), SmemLayoutO{});
+            auto r2s_tiled_copy = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma_pv);
+            auto r2s_thr_copy = r2s_tiled_copy.get_thread_slice(tid);
 
-    warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);
-    ++smem_pipe_read_v;
-    Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
-    #pragma unroll
-    for (int m = 0; m < size(score_max); ++m) {
-        #pragma unroll 
-        for (int n = 0; n < size<1>(acc_row_layout); ++n) {
-            scores(m, n) *= score_scale(m);
+            auto frag = convert_op(*reinterpret_cast<const cutlass::Array<float, decltype(size(tOrO))::value>*>(tOrO.data()));
+            Tensor tOrO_bf16 = make_tensor(make_rmem_ptr<TO>(&frag), tOrO.layout());
+            Tensor tAccOrO = r2s_thr_copy.retile_S(tOrO_bf16);
+            Tensor tAccOsO = r2s_thr_copy.partition_D(sO);
+
+            cutlass::arch::NamedBarrier::sync(kConsumerThreads, 0);
+            cute::copy(r2s_tiled_copy, tAccOrO, tAccOsO);
+            cutlass::arch::fence_view_async_shared();
+            cutlass::arch::NamedBarrier::arrive(
+                kConsumerThreads + cutlass::NumThreadsPerWarp, 
+                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier
+            );
+            Tensor mO = tma_o.get_tma_tensor(LayoutO{}.shape());
+            Tensor gO = local_tile(mO(_,_,head_idx, batch_idx), select<0,2>(cta_tiler), make_coord(q_tile_idx, _0{}));
+            auto cta_tma = tma_o.get_slice(_0{});
+            Tensor tOgO = cta_tma.partition_D(gO);
+            Tensor tOsO = cta_tma.partition_S(sO);
+
+            if (warp_idx == kWarps-1) {
+                cutlass::arch::NamedBarrier::sync(kConsumerThreads + cutlass::NumThreadsPerWarp, 
+                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                int lane_predicate = cute::elect_one_sync();
+                if (lane_predicate) {
+                    cute::copy(tma_o, tOsO, tOgO);
+                    tma_store_arrive();
+                }
+            }
         }
-    }
-    return;
+        tma_store_wait<0>();
+    }  
+    
 }
+
 
 template <class TQ, class TK, class TV, class TO, int D>
 void run_flash_attn(int B, int T, int NH,
@@ -597,9 +633,15 @@ void run_flash_attn(int B, int T, int NH,
         make_stride(v_seq_stride, v_head_dim_stride, v_head_stride, v_batch_stride)                                   // stride for B (batch_size)
     );
 
+    auto LayoutO = make_layout(
+        make_shape(seq_len, HEAD_DIM, n_heads, batch_size),
+        make_stride(o_seq_stride, o_head_dim_stride, o_head_stride, o_batch_stride)                                   // stride for B (batch_size)
+    );
+
     Tensor mQ = make_tensor(make_gmem_ptr(Q), LayoutQ);
     Tensor mK = make_tensor(make_gmem_ptr(K), LayoutK);
     Tensor mV = make_tensor(make_gmem_ptr(V), LayoutV);
+    Tensor mO = make_tensor(make_gmem_ptr(O), LayoutO);
 
     auto tma_q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
@@ -625,6 +667,16 @@ void run_flash_attn(int B, int T, int NH,
         _1{}
     );
 
+    auto tma_o = cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        mO,
+        SmemLayoutO,
+        make_shape(Int<bM>{}, Int<HEAD_DIM>{}),
+        _1{}
+    );
+
+    Copy_Atom SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, TO>{};
+
     using AtomLayoutMNK = Layout<Shape<Int<bM / 64>, _1, _1>>;    
 
     using TiledMmaQK = decltype(make_tiled_mma(GMMA::ss_op_selector<TQ, TK, float, TiledShape_MNK>(), AtomLayoutMNK{}));
@@ -642,11 +694,14 @@ void run_flash_attn(int B, int T, int NH,
     void const* kernel = reinterpret_cast<void const*>(
         &flash_attn_device<TQ, TK, TV, TO, 
                           decltype(TiledShape_MNK{}),
-                          decltype(LayoutQ), decltype(LayoutK), decltype(LayoutV),
+                          decltype(LayoutQ), decltype(LayoutK),
+                          decltype(LayoutV), decltype(LayoutO),
                           decltype(SmemLayoutQ), decltype(tma_q),
                           decltype(SmemLayoutK), decltype(tma_k),
                           decltype(SmemLayoutV), decltype(tma_v),
-                          decltype(SmemLayoutVt), decltype(SmemLayoutO), 
+                          decltype(SmemLayoutVt), 
+                          decltype(SmemLayoutO),  decltype(tma_o),
+                          decltype(SmemCopyAtomO),
                           TiledMmaQK, TiledMmaPV,
                           NUM_WARPS, NUM_WARPGROUPS, NUM_CONSUMER_THREADS,  NUM_THREADS,
                           bM, bN, HEAD_DIM, bP, CLUSER_M>);
@@ -670,7 +725,7 @@ void run_flash_attn(int B, int T, int NH,
                                                             Q, tma_q,
                                                             K, tma_k, 
                                                             V, tma_v,
-                                                            O, 
+                                                            O, tma_o,
                                                             batch_size, seq_len, n_heads, HEAD_DIM,
                                                             scale);
 }
@@ -686,23 +741,71 @@ void flash_attention(int B, int T, int NH, int D,
     run_flash_attn<TQ, TK, TV, TO, 128>(B, T, NH, Q, K, V, O, stream);
 }
 
-extern "C" void flash_attention_bf16_launcher(
-    int B, int T, int NH, int HEAD_DIM,
-    const void* Q, const void* K, const void* V, void* O,
-    cudaStream_t stream)
-{
+
+
+int main(int argc, char** argv) {
+    int B = 8;
+    int T = 2048;      // sequence length
+    int NH = 8;      // number of heads
+    int HEAD_DIM = 128;     // head size
+    int D = NH * HEAD_DIM; // model dim per token
+
     using TQ = cute::bfloat16_t;
     using TK = cute::bfloat16_t;
     using TV = cute::bfloat16_t;
     using TO = cute::bfloat16_t;
 
-    // Call your templated entrypoint
-    flash_attention<TQ, TK, TV, TO>(
-        B, T, NH, HEAD_DIM,
-        static_cast<const TQ*>(Q),
-        static_cast<const TK*>(K),
-        static_cast<const TV*>(V),
-        static_cast<TO*>(O),
-        stream);
-}
+    // Replace lines 141-144 with:
+    thrust::host_vector<TQ> h_Q(B*T*D);
+    thrust::host_vector<TK> h_K(B*T*D);
+    thrust::host_vector<TV> h_V(B*T*D);
+    thrust::host_vector<TO> h_O(B*T*D);
 
+    for (int j = 0; j < B*T*D; ++j) h_Q[j] = TQ(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < B*T*D; ++j) h_K[j] = TK(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < B*T*D; ++j) h_V[j] = TV(int((rand() % 2) ? 1 : -1));
+    for (int j = 0; j < B*T*D; ++j) h_O[j] = TV(0);
+
+    thrust::device_vector<TQ> d_Q = h_Q;
+    thrust::device_vector<TK> d_K = h_K;
+    thrust::device_vector<TV> d_V = h_V;
+    thrust::device_vector<TV> d_O = h_O;
+    thrust::device_vector<TO> d_O_ref = h_O;  // Reference result
+
+    // // Initialize cuBLAS
+    // cublasHandle_t cublas_handle;
+    // cublasCreate(&cublas_handle);
+
+    // printf("Running correctness verification...\n");
+    
+    // // Run cuBLAS reference
+    // d_C_ref = h_C;  // Reset
+    // run_cublas_gemm(cublas_handle, transA, transB, m, n, k, 
+    //                static_cast<float>(alpha),
+    //                d_A.data().get(), ldA,
+    //                d_B.data().get(), ldB,
+    //                static_cast<float>(beta),
+    //                d_C_ref.data().get(), ldC);
+    
+    // Run CuTe implementation
+    d_O = h_O;  // Reset
+    flash_attention<TQ, TK, TV, TO>(B, T, NH, HEAD_DIM,
+        d_Q.data().get(),
+        d_K.data().get(),
+        d_V.data().get(),
+        d_O.data().get());
+    
+    // Copy results back to host for verification
+    thrust::host_vector<TO> cute_result = d_O;
+    thrust::host_vector<TO> cudnn_result = d_O_ref;
+    
+    // Verify correctness
+    // bool passed = verify_matrix(cudnn_result, cute_result, B, T, D);
+    // if (passed) {
+    //     printf("✓ Correctness verification passed!\n");
+    // } else {
+    //     printf("✗ Correctness verification FAILED!\n");
+    //     cublasDestroy(cublas_handle);
+    //     return 1;
+    // }
+}
