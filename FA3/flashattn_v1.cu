@@ -66,7 +66,7 @@ __device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const &tenso
         row_max(m) = init ? tensor(m, 0) : max(row_max(m), tensor(m, 0));
 
         #pragma unroll
-        for (int n = 0; n < size<1>(tensor); ++n) {
+        for (int n = 1; n < size<1>(tensor); ++n) {
             row_max(m) = max(row_max(m), tensor(m, n));
         }
     }
@@ -89,7 +89,7 @@ __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const &tenso
         row_sum(m) = init ? tensor(m, 0) : (row_sum(m) + tensor(m, 0));
         
         #pragma unroll
-        for (int n = 0; n < size<1>(tensor); ++n) {
+        for (int n = 1; n < size<1>(tensor); ++n) {
             row_sum(m) = row_sum(m) + tensor(m, n);
         }
     }
@@ -99,8 +99,8 @@ __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const &tenso
         for (int i = 0; i < size(row_sum); ++i) {
             float val = row_sum(i);
 
-            val +=  __shfl_xor_sync(0xfffffff, val, 1);
-            val +=  __shfl_xor_sync(0xfffffff, val, 2);
+            val +=  __shfl_xor_sync(0xffffffff, val, 1);
+            val +=  __shfl_xor_sync(0xffffffff, val, 2);
 
             row_sum(i) = val;
         }
@@ -177,8 +177,8 @@ flash_attn_device(CtaTiler cta_tiler,
     params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
 
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<TQ> / 8);
-    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0,2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<TQ> / 8); // faster than init a new aligned_array or array_engine
-    static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0,2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<TQ> / 8); 
+    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0,2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<TK> / 8); // faster than init a new aligned_array or array_engine
+    static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(take<0,2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<TV> / 8); 
 
     params.transaction_bytes = TmaTransactionBytesK;
 
@@ -194,7 +194,7 @@ flash_attn_device(CtaTiler cta_tiler,
     if (warp_group_idx == 0) {
         cutlass::arch::warpgroup_reg_dealloc<24>();
 
-        int warp_idx_in_wg = __shfl_sync(0xfffffff, (threadIdx.x / 32) % 4, 0);
+        int warp_idx_in_wg = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if (warp_idx_in_wg == 0) {
             PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
             PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
@@ -332,6 +332,10 @@ flash_attn_device(CtaTiler cta_tiler,
             make_layout(get<0,0>(tSrS.layout()), get<1>(tSrS.layout())),
             make_layout(get<0,1>(tSrS.layout()), get<0,2>(tSrS.layout()), get<2>(tSrS.layout()))
         );
+        Layout O_row_layout = make_layout(
+            make_layout(get<0,0>(tOrO.layout()), get<1>(tOrO.layout())),
+            make_layout(get<0,1>(tOrO.layout()), get<0,2>(tOrO.layout()), get<2>(tOrO.layout()))
+        );
         Tensor scores = make_tensor(tSrS.data(), acc_row_layout);    
 
         reduce_max<true>(scores, score_max);
@@ -339,7 +343,7 @@ flash_attn_device(CtaTiler cta_tiler,
         for (int m = 0; m < size<0>(scores); ++m) {
             auto row_max = score_max(m);
             #pragma unroll
-            for (int n = 0; n < size<0>(scores); ++n) {
+            for (int n = 0; n < size<1>(scores); ++n) {
                 scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
             }
         }
@@ -358,14 +362,14 @@ flash_attn_device(CtaTiler cta_tiler,
 
         clear(score_scale);
         constexpr int n_masking_steps = bM / bN + 1;
-        for (int mask_step = 0; mask_step < n_masking_steps, kv_tile_idx > 0; ++mask_step, --kv_tile_idx) {
+        for (int mask_step = 0; mask_step < n_masking_steps && kv_tile_idx > 0; ++mask_step, --kv_tile_idx) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(cta_tiler));
             pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
             cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + (3-warp_group_idx));
             gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
 
             if (mask_step > 0) {
-                Tensor scores = make_tensor(tOrO.data(), acc_row_layout);    
+                Tensor scores = make_tensor(tOrO.data(), O_row_layout);    
                 #pragma unroll
                 for (int m = 0; m < size(score_max); ++m) {
                     #pragma unroll 
@@ -392,7 +396,7 @@ flash_attn_device(CtaTiler cta_tiler,
             for (int i = 0; i < size(tScS); ++i) {
                 int qo_idx = get<0>(tScS(i)) + q_tile_idx * bM;
                 int kv_idx = get<1>(tScS(i)) + kv_tile_idx * bK;
-                if (kv_idx >= qo_idx + 1) {
+                if (kv_idx >= qo_idx) {
                     tSrS(i) = -INFINITY;
                 }
             } 
@@ -412,7 +416,7 @@ flash_attn_device(CtaTiler cta_tiler,
             for (int m = 0; m < size<0>(scores); ++m) {
                 auto row_max = score_max(m);
                 #pragma unroll
-                for (int n = 0; n < size<0>(scores); ++n) {
+                for (int n = 0; n < size<1>(scores); ++n) {
                     scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
                 }
             }
@@ -440,7 +444,7 @@ flash_attn_device(CtaTiler cta_tiler,
             cutlass::arch::NamedBarrier::sync(kConsumerThreads, 3 + warp_group_idx);
             gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()), tSrS);
 
-            Tensor scores = make_tensor(tOrO.data(), acc_row_layout); 
+            Tensor scores = make_tensor(tOrO.data(), O_row_layout); 
             #pragma unroll
             for (int m = 0; m < size(score_max); ++m) {
                 #pragma unroll 
@@ -476,7 +480,7 @@ flash_attn_device(CtaTiler cta_tiler,
             for (int m = 0; m < size<0>(scores); ++m) {
                 auto row_max = score_max(m);
                 #pragma unroll
-                for (int n = 0; n < size<0>(scores); ++n) {
+                for (int n = 0; n < size<1>(scores); ++n) {
                     scores(m, n) = exp2f(scores(m, n) * scale - row_max * scale);
                 }
             }
@@ -500,7 +504,7 @@ flash_attn_device(CtaTiler cta_tiler,
 
         // ADD THE FINAL SECTION HERE (BEFORE THE CLOSING BRACE OF THE ELSE BLOCK):
         cutlass::arch::NamedBarrier::arrive(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
-        scores = make_tensor(tOrO.data(), acc_row_layout); 
+        scores = make_tensor(tOrO.data(), O_row_layout); 
         #pragma unroll
         for (int m = 0; m < size(score_max); ++m) {
             #pragma unroll 
@@ -510,12 +514,15 @@ flash_attn_device(CtaTiler cta_tiler,
         }
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
         gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+
+        scores = make_tensor(tSrS.data(), acc_row_layout);
+        for (int i = 0; i < )
         
         warpgroup_wait<0>();
         pipeline_v.consumer_release(smem_pipe_read_v);
         ++smem_pipe_read_v;
         
-        scores = make_tensor(tOrO.data(), acc_row_layout); 
+        scores = make_tensor(tOrO.data(), O_row_layout); 
         #pragma unroll
         for (int m = 0; m < size(score_max); ++m) {
             #pragma unroll 
