@@ -1,5 +1,6 @@
 import cutlass 
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.cute.runtime import from_dlpack
 import torch
 import math
@@ -91,7 +92,7 @@ class HopperGemm:
         )
 
         tma_atom_a, tma_tensor_a = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            cute.nvgpu.cpasync.CopyBulkTensorTileGS2Op(),
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
             A,
             cute.slice_(sA_layout, (None, None, 0)),
             (self.BM, self.BK),
@@ -99,7 +100,7 @@ class HopperGemm:
         )
 
         tma_atom_b, tma_tensor_b = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            cute.nvgpu.cpasync.CopyBulkTensorTileGS2Op(),
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
             B,
             cute.slice_(sB_layout, (None, None, 0)),
             (self.BN, self.BK),
@@ -132,7 +133,7 @@ class HopperGemm:
         tma_atom_a: cute.CopyAtom,
         mB: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
-        gC: cute.Tensor,
+        mC: cute.Tensor,
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
     ):
@@ -154,12 +155,12 @@ class HopperGemm:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
 
-        producer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread)
-        consumer_group = cutlass.utils.CooperativeGroup(cutlass.utils.Agent.Thread)
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
         tma_load_bytes = (self.BM * self.BK + self.BN * self.BK) * 2
 
-        mainloop_pipeline = cutlass.utils.PipelineTmaAsync(
+        mainloop_pipeline = pipeline.PipelineTmaAsync(
             storage.ab_barrier_full.data_ptr(),
             self.num_ab_pipeline_stages,
             producer_group,
@@ -171,9 +172,9 @@ class HopperGemm:
 
         gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, None))
         gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, None))
-        gC = cute.local_tile(mC, (self.BM, self.BN), (bidx, bidy))
+        gC = cute.local_tile(gC, (self.BM, self.BN), (bidx, bidy))
 
-        tAsA, tAgA = cute.nvgpu.tma_partition(
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
             tma_atom_a,
             cute.Int32(0),
             cute.make_layout((1,)),
@@ -181,7 +182,7 @@ class HopperGemm:
             cute.group_modes(gA, 0, 2)
         )
 
-        tBsB, tBgB = cute.nvgpu.tma_partition(
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b,
             cute.Int32(0),
             cute.make_layout((1,)),
@@ -193,17 +194,17 @@ class HopperGemm:
 
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(gA)
-        tCsB = thr_mma.partition_B(gB)
-        tCgC = thr_mma.partition_C(gC)
+        # tCsB = thr_mma.partition_B(gB)
+        # tCgC = thr_mma.partition_C(gC)
 
-        tCrA = thr_mma.make_fragment_A(tCsA);
-        tCrB = thr_mma.make_fragment_B(tCsB);
+        # tCrA = thr_mma.make_fragment_A(tCsA);
+        # tCrB = thr_mma.make_fragment_B(tCsB);
         
-        tCrC = thr_mma.make_fragment_A(tCgC.shape);
-        tCrC.fill(0.0)
+        # tCrC = thr_mma.make_fragment_A(tCgC.shape);
+        # tCrC.fill(0.0)
 
-        consumer_state = cutlass.utils.make_pipeline_state(cutlass.PipelineUserType.Consumer, self.num_ab_pipeline_stages)
-        producer_state = cutlass.utils.make_pipeline_state(cutlass.PipelineUserType.Producer, self.num_ab_pipeline_stages)
+        # consumer_state = cutlass.utils.make_pipeline_state(cutlass.PipelineUserType.Consumer, self.num_ab_pipeline_stages)
+        # producer_state = cutlass.utils.make_pipeline_state(cutlass.PipelineUserType.Producer, self.num_ab_pipeline_stages)
 
 
 
@@ -224,4 +225,4 @@ if __name__ == "__main__":
     compiled_kernel = cute.compile(gemm, A_dlpack, B_dlpack, C_dlpack, stream)
     torch_stream.synchronize()
 
-    compiled_kernel(gA, gB, gC, stream)
+    compiled_kernel(A_dlpack, B_dlpack, C_dlpack, stream)
