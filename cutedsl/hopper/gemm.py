@@ -285,7 +285,7 @@ class HopperGemm:
                     cute.copy(
                         tma_atom_b,
                         tBgB_k[(None, mainloop_producer_state.count)],
-                        tBgB[(None, mainloop_producer_state.index)],
+                        tBsB[(None, mainloop_producer_state.index)],
                         tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                             mainloop_producer_state
                         )
