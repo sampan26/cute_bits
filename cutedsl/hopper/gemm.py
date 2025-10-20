@@ -21,8 +21,8 @@ class HopperGemm:
         self.cta_tiler = (self.BM, self.BN, self.BK)
         self.atom_layout_mnk = (2,1,1)
 
-        self.consumer_warp_groups = math.prod(self.atom_layout_mnk)
-        self.producer_warp_groups = 1
+        self.num_consumer_warp_groups = math.prod(self.atom_layout_mnk)
+        self.num_producer_warp_groups = 1
               
     @cute.jit
     def __call__(
@@ -88,8 +88,8 @@ class HopperGemm:
             cute.nvgpu.warpgroup.OperandMajorMode.K, # A is K major
             cute.nvgpu.warpgroup.OperandMajorMode.K, # B is K major
             self.acc_dtype,
-            (self.consumer_warp_groups, 1, 1), # atom_mnk
-            (self.cta_tiler[0] // self.consumer_warp_groups, self.cta_tiler[1]), # Has to be 64 for M-Major
+            (self.num_consumer_warp_groups, 1, 1), # atom_mnk
+            (self.cta_tiler[0] // self.num_consumer_warp_groups, self.cta_tiler[1]), # Has to be 64 for M-Major
         )
 
         @cute.struct
@@ -112,7 +112,7 @@ class HopperGemm:
             self.cta_tiler[1],
         )
 
-        num_threads = 128 * (self.consumer_warp_groups + self.producer_warp_groups)
+        num_threads = 128 * (self.num_consumer_warp_groups + self.num_producer_warp_groups)
 
         self.kernel(
             tma_atom_a,
@@ -151,22 +151,18 @@ class HopperGemm:
         tile_schedule_params: utils.PersistentTileSchedulerParams
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()
-        bdim, _, _ = cute.arch.block_dim()
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        warp_idx_in_warpgroup = cute.arch.warp_idx() % 4
-        warp_idx = cute.arch.make_warp_uniform(warp_idx_in_warpgroup)
-        warpgroup_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx() // 4)
+        warp_idx_in_warpgroup = cute.arch.make_warp_uniform((tidx // 128) % 4)
+        warpgroup_idx = cute.arch.make_warp_uniform(tidx // 128)
 
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
-        is_consumer = warpgroup_idx == 0 or warpgroup_idx == 1
-        is_producer = not is_consumer
+        is_producer = warpgroup_idx < self.num_producer_warp_groups
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)        
@@ -199,17 +195,15 @@ class HopperGemm:
             cute.recast_ptr(sA.iterator, c_smem_layout_staged.inner, dtype=self.c_dtype),
             c_smem_layout_staged.outer
         )
-
-        print(cute.slice_(self.cta_tiler, (None, 0, None)))
         
         gA = cute.local_tile(
             mA,
-            (self.cta_tiler[0], self.cta_tiler[2]),
+            cute.slice_(self.cta_tiler, (None, 0, None)),
             (None, None)
         )
         gB = cute.local_tile(
             mB,
-            (self.cta_tiler[1], self.cta_tiler[2]),
+            cute.slice_(self.cta_tiler, (0, None, None)),
             (None, None)
         )
         gC = cute.local_tile(
@@ -218,9 +212,156 @@ class HopperGemm:
             (None, None)
         )
         
+        cta_crd = (0,)
+        cta_layout = cute.make_layout((1,))
+        tAsA, tAgA  = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            cta_crd,
+            cta_layout,
+            cute.group_modes(sA, 0, 2),
+            cute.group_modes(gA, 0, 2)
+        )
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b,
+            cta_crd,
+            cta_layout,
+            cute.group_modes(sB, 0, 2),
+            cute.group_modes(gB, 0, 2)
+        )
+
+        num_tiles_k = cute.size(tAgA, mode=[2])
         
+        # mma_warp_group_thread_layout = cute.make_layout(
+        #     self.num_consumer_warp_groups, stride=128
+        # )
+        # thr_mma = tiled_mma.get_slice(
+        #     mma_warp_group_thread_layout(warpgroup_idx - self.num_producer_warp_groups)
+        # )
+
+        thr_mma = tiled_mma.get_slice(tidx - self.num_producer_warp_groups * 128)
+
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = thr_mma.make_fragment_A(tCsA)
+        tCrB = thr_mma.make_fragment_B(tCsB)
+
+        tCgC = thr_mma.partition_C(gC)
+        accumulator = cute.make_fragment(tCgC.shape[:3], self.acc_dtype)
+
+        cute.arch.sync_threads()
+
+        if is_producer:
+            cute.arch.warpgroup_reg_dealloc(24)
+
+        if warp_idx == 0:
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_schedule_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+
+            work_tile = tile_sched.initial_work_tile_info()
+
+            mainloop_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.pipeline_stages
+            )
+
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+                tAgA_k = tAgA[(None, tile_coord_mnl[0], None)]
+                tBgB_k = tAgA[(None, tile_coord_mnl[1], None)]
+
+                mainloop_producer_state.reset_count()
+
+                for k_tile in range(num_tiles_k):
+                    mainloop_pipeline.producer_acquire(mainloop_producer_state)
+
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_k[(None, mainloop_producer_state.count)],
+                        tAsA[(None, mainloop_producer_state.index)],
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                            mainloop_producer_state
+                        )
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB_k[(None, mainloop_producer_state.count)],
+                        tAsA[(None, mainloop_producer_state.index)],
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                            mainloop_producer_state
+                        )
+                    )
+
+                    mainloop_pipeline.producer_commit(mainloop_producer_state)
+                    mainloop_producer_state.advance()
+                
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+            mainloop_pipeline.producer_tail(mainloop_producer_state)
+
+        
+        if not is_producer:
+            cute.arch.warpgroup_reg_alloc(240);
+            tile_sched = utils.StaticPersistentTileScheduler.create(
+                tile_schedule_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            work_tile = tile_sched.initial_work_tile_info()
+
+            mainloop_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.pipeline_stages
+            )
+
+            num_wgmma_tiles_k = cute.size(tCrA, mode=[2])
+
+            # copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+            #     self.c_layout,
+            #     elem_ty_d=self.c_dtype,
+            #     elem_ty_acc=self.acc_dtype
+            # )
+
+            # tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_mma)
+            # thr_copy_r2s = tiled_copy_r2s.get_slice(tidx - self.num_producer_warp_groups * 128)
+            # tRS_sD = thr_copy_r2s.partition_D(sC)
+            
+            # tRS_rAcc = thr_copy_r2s.retile(accumulator)
+
+            # rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+            # tRS_rD_layout = cute.make_layout(rD_shape[:3])
+            # tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+            # tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
+            # size_tRS_rD = cute.size(tRS_rD)
 
 
+            while work_tile.is_valid_tile:
+                tile_coord_mnl = work_tile.tile_idx
+
+                mainloop_consumer_state.reset_count()
+                accumulator.fill(0.0)
+                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                cute.nvgpu.warpgroup.fence() # try without
+
+                for k_tile in range(num_tiles_k):
+                    mainloop_pipeline.consumer_wait(mainloop_consumer_state)
+
+                    for k_block_idx in cutlass.range_constexpr(num_wgmma_tiles_k):
+                        k_block_coord = (None, None, k_block_idx, mainloop_consumer_state.index)
+                        cute.gemm(
+                            tiled_mma,
+                            accumulator,
+                            tCrA[k_block_coord],
+                            tCrB[k_block_coord],
+                            accumulator,
+                        )
+
+                    cute.nvgpu.warpgroup.commit_group()
+                    cute.nvgpu.warpgroup.wait_group(0)
+
+                    mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                    mainloop_consumer_state.advance()
+                
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+                    
     @staticmethod
     def _make_smem_layout(
         smem_shape: Tuple[int, int],
