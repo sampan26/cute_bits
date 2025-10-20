@@ -63,12 +63,18 @@ struct AttentionKernelTraits {
     
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0,2>(TileShape{})));
 
-    using GmemLayoutAtom = decltype()
+    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
     ))
+};
+
+
+
+
+template<typename AttentionKernelTraits, typename SharedStorage>
+void run_flash_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+
 }
-
-
 
 
 template <typename T, int Headdim>
@@ -76,5 +82,6 @@ void run_mha_fwd(Flash_fwd_params params, cudaStream_t stream) {
     static_assert(Headdim == 128);
     BOOL_SWITCH(params.is_casaul, Is_causal, [&] {
         using Kernel_traits = AttentionKernelTraits<128, 128, Is_causal ? 128 : 178, Is_causal ? 2 : 1, T>;
+        run_flash_mha_fwd<Kernel_traits, SharedStorage<Kernel_traits>>(params, stream);
     });
 }
