@@ -168,8 +168,8 @@ class HopperGemm:
         storage = smem.allocate(self.shared_storage)        
 
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_ptr.data_ptr()
-        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 8)
+        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 8)
         
         
         tma_copy_bytes = cute.size_in_bytes(self.a_dtype, cute.slice_(a_smem_layout_staged, (None, None, 0))) \
@@ -267,7 +267,7 @@ class HopperGemm:
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_k = tAgA[(None, tile_coord_mnl[0], None)]
-                tBgB_k = tAgA[(None, tile_coord_mnl[1], None)]
+                tBgB_k = tBgB[(None, tile_coord_mnl[1], None)]
 
                 mainloop_producer_state.reset_count()
 
@@ -285,7 +285,7 @@ class HopperGemm:
                     cute.copy(
                         tma_atom_b,
                         tBgB_k[(None, mainloop_producer_state.count)],
-                        tAsA[(None, mainloop_producer_state.index)],
+                        tBgB[(None, mainloop_producer_state.index)],
                         tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                             mainloop_producer_state
                         )
