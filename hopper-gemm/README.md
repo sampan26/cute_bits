@@ -1,6 +1,6 @@
 # CUTLASS vs CUBLAS Performance Comparison
 
-This benchmark compares the performance of CUBLAS against various CUTLASS kernel implementations for matrix multiplication operations.
+This benchmark compares the performance of CUBLAS against various CUTLASS kernel implementations for matrix multiplication operations (8192x8192x8192).
 
 ## Performance Results
 
