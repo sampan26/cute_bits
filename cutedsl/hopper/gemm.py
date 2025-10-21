@@ -24,6 +24,11 @@ class HopperGemm:
         self.num_consumer_warp_groups = math.prod(self.atom_layout_mnk)
         self.num_producer_warp_groups = 1
               
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=1, num_threads=self.num_consumer_warp_groups
+        )
+
+
     @cute.jit
     def __call__(
         self, 
@@ -246,8 +251,10 @@ class HopperGemm:
         tCrB = thr_mma.make_fragment_B(tCsB)
 
         tCgC = thr_mma.partition_C(gC)
+        print("gC:", gC.shape)
+        print("tCgC", tCgC.shape)
         accumulator = cute.make_fragment(tCgC.shape[:3], self.acc_dtype)
-
+        print("accumulator", accumulator.shape)
         cute.arch.sync_threads()
 
         if is_producer:
@@ -313,24 +320,51 @@ class HopperGemm:
 
             num_wgmma_tiles_k = cute.size(tCrA, mode=[2])
 
-            # copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-            #     self.c_layout,
-            #     elem_ty_d=self.c_dtype,
-            #     elem_ty_acc=self.acc_dtype
-            # )
+            # Copy Atom
+            # ThrID:           1:0
+            # TV Layout Src:   (1,1):(0,0)
+            copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+                self.c_layout,
+                elem_ty_d=self.c_dtype,
+                elem_ty_acc=self.acc_dtype,
+            )
 
-            # tiled_copy_r2s = cute.make_tiled_copy_S(copy_atom_r2s, tiled_mma)
-            # thr_copy_r2s = tiled_copy_r2s.get_slice(tidx - self.num_producer_warp_groups * 128)
-            # tRS_sD = thr_copy_r2s.partition_D(sC)
+            # Provides a TV Copy Atom, usually (32, (1,4)) src and (32, 4) dst
+            copy_atom_C = cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(
+                    self.c_layout.is_m_major_c(),
+                    4,
+                ),
+                self.c_dtype,
+            )
+
+            # Provides smallest tiled copy that can retile LayoutC_TV for use with pipelind epilogues with subtile stores
+            # Tiled Copy Tiler MN:        ((8,8,2):(1,16,8),(4,2):(2,1))
+            tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+
+            # Creates a tiled copy out of the copy_atom mthat matches the Src-Layout of tiled_copy
+            tiled_copy_r2s = cute.make_tiled_copy_S(
+                copy_atom_r2s,
+                tiled_copy_C_Atom,
+            )
+
+            # (R2S, R2S_M, R2S_N, PIPE_D)  ((8,8,2):(1,16,8),(4,2):(2,1))
+            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx - self.num_producer_warp_groups * 128)
+            tRS_sD = thr_copy_r2s.partition_D(sC) # ((1,(2,2)),1,(4,8),(1,1))
+            tRS_rAcc = thr_copy_r2s.retile(accumulator) # (R2S, R2S_M, R2S_N) ((1,128),1,1)
             
-            # tRS_rAcc = thr_copy_r2s.retile(accumulator)
+            rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+            tRS_rD_layout = cute.make_layout(rD_shape[:3])
+            tRS_rD = cute.make_fragment(tRS_rD_layout.shape, self.acc_dtype)
+            tRS_rD_out = cute.make_fragment(tRS_rD_layout.shape, self.c_dtype)
+            size_tRS_rD = cute.size(tRS_rD)
 
-            # rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-            # tRS_rD_layout = cute.make_layout(rD_shape[:3])
-            # tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
-            # tRS_rD_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
-            # size_tRS_rD = cute.size(tRS_rD)
 
+            print("tRS_sD:", tRS_sD.shape)
+            print("tRS_rD:", tRS_rD.shape)
+            print("tRS_rD_out:", tRS_rD_out.shape)
+            print("tRS_rAcc:", tRS_rAcc.shape, tRS_rAcc.stride)
+            print("size_tRS_rD:", size_tRS_rD)
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
@@ -358,6 +392,51 @@ class HopperGemm:
 
                     mainloop_pipeline.consumer_release(mainloop_consumer_state)
                     mainloop_consumer_state.advance()
+
+                cute.nvgpu.warpgroup.wait_group(0)
+                tcgc_for_tma_partition = cute.zipped_divide(gC, (self.cta_tiler[0], self.cta_tiler[1]))
+
+                bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_c,
+                    (0,),
+                    cute.make_layout((1,)),
+                    cute.group_modes(sC, 0, 2),
+                    tcgc_for_tma_partition
+                )
+                print("bSG_sD:", bSG_sD.shape)
+                print("bSG_gD:", bSG_gD.shape)
+
+                print("tcgc_for_tma_partition:", tcgc_for_tma_partition.shape)
+                num_epi_tiles = cute.size(tcgc_for_tma_partition, mode=[1])
+                # epi_tile_layout = cute.make_layout(
+                #     tcgc_for_tma_partition.shape[1], stride=(tcgc_for_tma_partition.shape[1][1], 1)
+                # )
+
+
+                
+                for epi_idx in cutlass.range_constexpr(num_epi_tiles):
+                    for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                        tRS_rD[epi_v] = tRS_rAcc[epi_idx*size_tRS_rD+epi_v]
+                
+                    acc_vec = tRS_rD.load()
+                    tRS_rD_out.store(acc_vec.to(self.c_dtype))
+                    epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
+                    cute.copy(
+                        tiled_copy_r2s, 
+                        tRS_rD_out, 
+                        tRS_sD[(None, None, None, epi_buffer)]
+                    )
+
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
+
+
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    # gmem_coord = 
+                    
+
                 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
