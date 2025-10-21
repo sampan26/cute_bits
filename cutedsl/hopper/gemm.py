@@ -83,8 +83,8 @@ class HopperGemm:
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
             cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             C,
-            cute.slice_(self.a_smem_layout_staged, (None, None, 0)),
-            (self.cta_tiler[0], self.cta_tiler[2])
+            cute.slice_(self.c_smem_layout_staged, (None, None, 0)),
+            (self.cta_tiler[0], self.cta_tiler[1])
         )
 
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
@@ -106,6 +106,10 @@ class HopperGemm:
             ]
             smem_B: cute.struct.Align[
                 cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
+                1024,
+            ]
+            smem_C: cute.struct.Align[
+                cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged)],
                 1024,
             ]
 
@@ -196,9 +200,8 @@ class HopperGemm:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
         
-        sC = cute.make_tensor(
-            cute.recast_ptr(sA.iterator, c_smem_layout_staged.inner, dtype=self.c_dtype),
-            c_smem_layout_staged.outer
+        sC = storage.smem_C.get_tensor(
+            c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
         )
         
         gA = cute.local_tile(
@@ -320,6 +323,16 @@ class HopperGemm:
 
             num_wgmma_tiles_k = cute.size(tCrA, mode=[2])
 
+            tma_store_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.num_consumer_warp_groups * 128,
+            )
+            tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=1,
+                producer_group=tma_store_producer_group,
+            )
+
+
             # Copy Atom
             # ThrID:           1:0
             # TV Layout Src:   (1,1):(0,0)
@@ -425,10 +438,15 @@ class HopperGemm:
                         bSG_sD[(None, 0)],
                         bSG_gD[(None, tile_coord_mnl[0], tile_coord_mnl[1])],
                     )
+                    tma_store_pipeline.producer_commit()
+                    tma_store_pipeline.producer_acquire()
 
+                self.epilog_sync_barrier.arrive_and_wait()
                 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+            
+            tma_store_pipeline.producer_tail()
                     
     @staticmethod
     def _make_smem_layout(
@@ -475,8 +493,8 @@ class HopperGemm:
 if __name__ == "__main__":
     M, N, K = 4096,4096,4096
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    B = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    C = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
+    B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    C = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
     C_ref = torch.matmul(A, B.t())
     
     A_dlpack = from_dlpack(A, assumed_align=16)
@@ -494,3 +512,21 @@ if __name__ == "__main__":
     C = C.to(torch.bfloat16)
     C_ref = torch.matmul(A, B.t())
     torch.testing.assert_close(C, C_ref, atol=1e-3, rtol=1e-3)
+
+    num_iters = 50
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record(stream = torch_stream)
+    for i in range(num_iters):
+        compiled_kernel(A, B, C, stream)
+    end_event.record(stream = torch_stream)
+    torch.cuda.synchronize()
+    elapsed_ms = start_event.elapsed_time(end_event)
+    print(f"elapsed_ms: {elapsed_ms}")
+    elapsed_ms = elapsed_ms / num_iters
+
+    flops = 2 * M * N * K
+    tflops_per_s = (flops / 1e12) / (elapsed_ms / 1000)
+    print(f"elapsed_ms: {elapsed_ms}")
+    print(f"tflops_per_s: {tflops_per_s}")
