@@ -9,7 +9,21 @@
 
 using namespace cute;
 
-
+template<typename Kernel_traits>
+struct SharedStorage {
+    cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutQ>> smem_q;
+    cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutK>> smem_k;
+    union {
+        cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutV>> smem_v;
+        cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutO>> smem_o;
+    }
+    struct {
+        cutlass::arch::ClusterTransactionBarrier barrier_Q;
+        cutlass::arch::ClusterBarrier barrier_O;
+        typename MainloopPipeline::SharedStorage pipeline_k;
+        typename MainloopPipeline::SharedStorage pipeline_v;
+    }
+}
 
 
 template <int HEAD_DIM_, int BM_, int BN_, int NUM_STAGES_, typename T>
@@ -71,9 +85,13 @@ struct AttentionKernelTraits {
 
 
 
-template<typename AttentionKernelTraits, typename SharedStorage>
+template<typename AttentionKernelTraits, typename SharedStorage, bool Is_causal>
 void run_flash_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-
+    const int num_q_blocks = cute::ceil_div(params.seqlen, Kernel_traits::BM)
+    auto& kernel = &flash_fwd_kernel<Kernel_traits, Is_causal, SharedStorage>;
+    constexpr size_t smem_size = sizeof(SharedStorage);
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    kernel<<<dim3(num_q_blocks, params.h, params.b), Kernel_traits::NUM_THREADS, smem_size, stream>>>(params);
 }
 
 
@@ -82,6 +100,6 @@ void run_mha_fwd(Flash_fwd_params params, cudaStream_t stream) {
     static_assert(Headdim == 128);
     BOOL_SWITCH(params.is_casaul, Is_causal, [&] {
         using Kernel_traits = AttentionKernelTraits<128, 128, Is_causal ? 128 : 178, Is_causal ? 2 : 1, T>;
-        run_flash_mha_fwd<Kernel_traits, SharedStorage<Kernel_traits>>(params, stream);
+        run_flash_mha_fwd<Kernel_traits, SharedStorage<Kernel_traits>, Is_causal>(params, stream);
     });
 }
