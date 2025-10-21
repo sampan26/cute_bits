@@ -25,7 +25,7 @@ class HopperGemm:
         self.num_producer_warp_groups = 1
               
         self.epilog_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=1, num_threads=self.num_consumer_warp_groups
+            barrier_id=1, num_threads=self.num_consumer_warp_groups * 128
         )
 
 
@@ -251,10 +251,10 @@ class HopperGemm:
         tCrB = thr_mma.make_fragment_B(tCsB)
 
         tCgC = thr_mma.partition_C(gC)
-        print("gC:", gC.shape)
-        print("tCgC", tCgC.shape)
+        # print("gC:", gC.shape)
+        # print("tCgC", tCgC.shape)
         accumulator = cute.make_fragment(tCgC.shape[:3], self.acc_dtype)
-        print("accumulator", accumulator.shape)
+        # print("accumulator", accumulator.shape)
         cute.arch.sync_threads()
 
         if is_producer:
@@ -359,12 +359,12 @@ class HopperGemm:
             tRS_rD_out = cute.make_fragment(tRS_rD_layout.shape, self.c_dtype)
             size_tRS_rD = cute.size(tRS_rD)
 
-
-            print("tRS_sD:", tRS_sD.shape)
-            print("tRS_rD:", tRS_rD.shape)
-            print("tRS_rD_out:", tRS_rD_out.shape)
-            print("tRS_rAcc:", tRS_rAcc.shape, tRS_rAcc.stride)
-            print("size_tRS_rD:", size_tRS_rD)
+            # print("rD_shape:", rD_shape)
+            # print("tRS_sD:", tRS_sD.shape)
+            # print("tRS_rD:", tRS_rD.shape)
+            # print("tRS_rD_out:", tRS_rD_out.shape)
+            # print("tRS_rAcc:", tRS_rAcc.shape, tRS_rAcc.stride)
+            # print("size_tRS_rD:", size_tRS_rD)
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
@@ -394,48 +394,37 @@ class HopperGemm:
                     mainloop_consumer_state.advance()
 
                 cute.nvgpu.warpgroup.wait_group(0)
-                tcgc_for_tma_partition = cute.zipped_divide(gC, (self.cta_tiler[0], self.cta_tiler[1]))
 
                 bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
                     tma_atom_c,
                     (0,),
                     cute.make_layout((1,)),
                     cute.group_modes(sC, 0, 2),
-                    tcgc_for_tma_partition
+                    cute.group_modes(gC, 0, 2),
                 )
-                print("bSG_sD:", bSG_sD.shape)
-                print("bSG_gD:", bSG_gD.shape)
 
-                print("tcgc_for_tma_partition:", tcgc_for_tma_partition.shape)
-                num_epi_tiles = cute.size(tcgc_for_tma_partition, mode=[1])
-                # epi_tile_layout = cute.make_layout(
-                #     tcgc_for_tma_partition.shape[1], stride=(tcgc_for_tma_partition.shape[1][1], 1)
-                # )
-
-
+                # print("bSG_sD:", bSG_sD.shape)
+                # print("bSG_gD:", bSG_gD.shape)
                 
-                for epi_idx in cutlass.range_constexpr(num_epi_tiles):
-                    for epi_v in cutlass.range_constexpr(size_tRS_rD):
-                        tRS_rD[epi_v] = tRS_rAcc[epi_idx*size_tRS_rD+epi_v]
+                for v in cutlass.range_constexpr(size_tRS_rD):
+                    tRS_rD[v] = tRS_rAcc[v]
                 
-                    acc_vec = tRS_rD.load()
-                    tRS_rD_out.store(acc_vec.to(self.c_dtype))
-                    epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
+                acc_vec = tRS_rD.load()
+                tRS_rD_out.store(acc_vec.to(self.c_dtype))
+
+                cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, 0)])
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared,
+                    space=cute.arch.SharedSpace.shared_cta
+                )
+                self.epilog_sync_barrier.arrive_and_wait()
+
+                if warp_idx == self.num_producer_warp_groups * 4:
                     cute.copy(
-                        tiled_copy_r2s, 
-                        tRS_rD_out, 
-                        tRS_sD[(None, None, None, epi_buffer)]
+                        tma_atom_c,
+                        bSG_sD[(None, 0)],
+                        bSG_gD[(None, tile_coord_mnl[0], tile_coord_mnl[1])],
                     )
-
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-
-
-                    self.epilog_sync_barrier.arrive_and_wait()
-                    # gmem_coord = 
-                    
 
                 
                 tile_sched.advance_to_next_work()
@@ -487,8 +476,7 @@ if __name__ == "__main__":
     M, N, K = 4096,4096,4096
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    C = torch.zeros(M, K, device="cuda", dtype=torch.float32)
-    C_out = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
+    C = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
     C_ref = torch.matmul(A, B.t())
     
     A_dlpack = from_dlpack(A, assumed_align=16)
@@ -503,9 +491,6 @@ if __name__ == "__main__":
 
     compiled_kernel(A_dlpack, B_dlpack, C_dlpack, stream)
 
-    print(C[0][0])
-    # for i in range(C.shape[0]):
-    #     for j in range(C.shape[1]):
-    #         a = float(C[0][0])
-            # a = C[0][0].to(torch.bfloat16)
-    # assert torch.allclose(C_out, C_ref, atol=1e-3)
+    C = C.to(torch.bfloat16)
+    C_ref = torch.matmul(A, B.t())
+    torch.testing.assert_close(C, C_ref, atol=1e-3, rtol=1e-3)
