@@ -49,7 +49,7 @@ mha_fwd(
     params.d = head_dim;
     params.is_casaul = is_casaul;
     params.scale_softmax = scale_softmax;
-    params.scale_softmax_log2 = scale_softmax_log2;
+    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
     //ptrs
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
