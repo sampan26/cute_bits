@@ -5,7 +5,7 @@
 struct Flash_fwd_params {
     using index_t = int64_t;
 
-    int b, seqlen_q, h, d;
+    int b, seqlen, h, d;
     bool is_causal;
     float scale_softmax, scale_softmax_log2;
 
@@ -27,3 +27,6 @@ struct Flash_fwd_params {
     index_t v_head_stride;
     index_t o_head_stride;
 };
+
+template<typename T, int Headdim>
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream);
