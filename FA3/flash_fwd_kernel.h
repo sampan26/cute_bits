@@ -11,9 +11,8 @@
 using namespace cute;
 
 
-
-CUTLASS_DEVICE void
-scheduler_barrier_arrive(int wg_idx) {
+template<int NumMmaThreads>
+CUTLASS_DEVICE inline void scheduler_barrier_arrive(int wg_idx) {
     if constexpr (NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, 3 + (3 - wg_idx) /*id*/);
     } else {
@@ -109,7 +108,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int HEAD_DIM = Kernel_traits::HEAD_DIM;
     constexpr int NUM_THREADS = Kernel_traits::NUM_THREADS;
     constexpr int NUM_PRODUCER_THREADS = Kernel_traits::NUM_PRODUCER_THREADS;
-    constexpr int NUM_CONSUMER_THREADS = size(typename Ktraits::TiledMmaQK{});
+    constexpr int NUM_CONSUMER_THREADS = size(typename Kernel_traits::TiledMmaQK{});
     constexpr int NUM_STAGES = Kernel_traits::NUM_STAGES;
     using Element = typename Kernel_traits::Element;
     using index_t = typename Kernel_traits::index_t;
@@ -117,26 +116,26 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     using TileShape = Kernel_traits::TileShape;
     const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
 
-    using MainloopPipeline = typename Ktraits::MainloopPipeline;
+    using MainloopPipeline = typename Kernel_traits::MainloopPipeline;
     using PipelineParams = typename MainloopPipeline::Params;
     using PipelineState = typename MainloopPipeline::PipelineState;
 
     auto LayoutQ = make_layout(
-        make_shape(params.seqlen, params.d, params. h, params.b), 
-        make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride)
+        make_shape(params.seqlen, params.d, params.h, params.b), 
+        make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride);
     )
 
     auto LayoutK = make_layout(
-        make_shape(params.seqlen, params.d, params. h, params.b), 
-        make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride)
+        make_shape(params.seqlen, params.d, params.h, params.b), 
+        make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride);
     )
     auto LayoutV = make_layout(
-        make_shape(params.seqlen, params.d, params. h, params.b), 
-        make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride)
+        make_shape(params.seqlen, params.d, params.h, params.b), 
+        make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride);
     )
     auto LayoutO = make_layout(
-        make_shape(params.seqlen, params.d, params. h, params.b), 
-        make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride)
+        make_shape(params.seqlen, params.d, params.h, params.b), 
+        make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride);
     )
 
     auto TMA_Q = cute::make_tma_copy(
@@ -150,7 +149,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     auto TMA_K = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(make_gmem_ptr(params.k_ptr), LayoutK),
-        Kernel_traits::SmemLayoutK(_,_,_0{}){},
+        Kernel_traits::SmemLayoutK{}(_,_,_0{}),
         make_shape(Int<BN>{}, Int<HEAD_DIM>{}),
         _1{}
     );
@@ -158,7 +157,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     auto TMA_V = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(make_gmem_ptr(params.v_ptr), LayoutV),
-        Kernel_traits::SmemLayoutV(_,_,_0{}){},
+        Kernel_traits::SmemLayoutV{}(_,_,_0{}),
         make_shape(Int<BN>{}, Int<HEAD_DIM>{}),
         _1{}
     );
@@ -176,8 +175,8 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
 
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), typename Kernel_traits::SmemLayoutK{});
-    Tensor sV = make_tensor(make_smem_ptr(storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
-    Tensor sVt = make_tensor(make_smem_ptr(storage.smem_k.data()), typename Kernel_traits::SmemLayoutVt{});
+    Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), typename Kernel_traits::SmemLayoutV{});
+    Tensor sVt = make_tensor(make_smem_ptr(storage.smem_v.data()), typename Kernel_traits::SmemLayoutVt{});
     Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), typename Kernel_traits::SmemLayoutO{});
 
     const int lane_predicate = cute::elect_one();
@@ -214,9 +213,9 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
             PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
-            Tensor mQ = tma_q.get_tma_tensor(LayoutQ.shape());
-            Tensor mK = tma_k.get_tma_tensor(LayoutK.shape());
-            Tensor mV = tma_v.get_tma_tensor(LayoutV.shape());
+            Tensor mQ = TMA_Q.get_tma_tensor(LayoutQ.shape());
+            Tensor mK = TMA_K.get_tma_tensor(LayoutK.shape());
+            Tensor mV = TMA_V.get_tma_tensor(LayoutV.shape());
 
             Tensor gQ = local_tile(mQ(_, _, head_idx, batch_idx), select<0, 2>(TileShape{}), make_coord(q_tile_idx, _0{}));
             Tensor gK = local_tile(mK(_, _, head_idx, batch_idx), select<1, 2>(TileShape{}), make_coord(_, _0{}));
@@ -238,7 +237,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
                 ++smem_pipe_write_k;
             }
 
-            cutlass::arch::NamedBarrier::sync(kConsumerThreads + cutlass::NumThreadsPerWarp, 1);
+            cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
             if (lane_predicate) {
                 storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
                 copy(TMA_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
@@ -247,7 +246,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             }
 
             if (lane_predicate) {
-                #pragma unroll2
+                #pragma unroll 2
                 for (; kv_tile_idx > 0; --kv_tile_idx) {
                     pipeline_k.producer_acquire(smem_pipe_write_k);
                     copy(TMA_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
@@ -277,7 +276,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
         const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
         PipelineState smem_pipe_read_k, smem_pipe_read_v;
         
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, 1);
+        cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
         if (warp_group_idx > 1) {
             cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS, 3 + 1);
         }
@@ -328,7 +327,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
         }
 
         softmax.update<true>(tSrS);
-        Tensor tOrP = make_tensor(convert_type<Element>(tSrS.data()), convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaPV>(tSrS.layout));
+        Tensor tOrP = make_tensor(convert_type<Element>(tSrS.data()), convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaPV>(tSrS.layout()));
         constexpr int masking_steps = ceil_div(BM, BN);
         
         #pragma unroll
@@ -343,7 +342,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
 
             pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
             gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_,_,_,smem_pipe_read_v.index()),tOrO);
-            scheduler_barrier_arrive();
+            scheduler_barrier_arrive(warp_group_idx);
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);
             {
@@ -363,7 +362,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             pipeline_v.consumer_release(smem_pipe_read_v);
             ++smem_pipe_read_k;
             ++smem_pipe_read_v;
-            cute::copy(make_tensor(convert_type<Element>(tSrS).data(),convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())), tOrP);
+            cute::copy(make_tensor(convert_type<Element>(tSrS).data(),convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaPV>(tSrS.layout())), tOrP);
         }
         #pragma unroll 1
         for (; kv_tile_idx > 0; --kv_tile_idx) {
@@ -374,7 +373,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             softmax.rescale_o(tOrO);
             pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
             gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_,_,_,smem_pipe_read_v.index()),tOrO);
-            scheduler_barrier_arrive();
+            scheduler_barrier_arrive(warp_group_idx);
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);
             softmax.update<false>(tSrS);
@@ -382,16 +381,16 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             pipeline_v.consumer_release(smem_pipe_read_v);
             ++smem_pipe_read_k;
             ++smem_pipe_read_v;
-            cute::copy(make_tensor(convert_type<Element>(tSrS).data(),convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())), tOrP);
+            cute::copy(make_tensor(convert_type<Element>(tSrS).data(),convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaPV>(tSrS.layout())), tOrP);
         }
-        attention.rescale_o(tOrO);
+        softmax.rescale_o(tOrO);
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
         gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_,_,_,smem_pipe_read_v.index()),tOrO);
-        attention.finalize(tSrS);
+        softmax.finalize(tSrS);
         warpgroup_wait<0>();
         pipeline_v.consumer_release(smem_pipe_read_v);
         ++smem_pipe_read_v;
-        attention.rescale_o(tOrO);
+        softmax.rescale_o(tOrO);
 
         {
             auto smem_tiled_copy_O = make_tiled_copy_C(Kernel_traits::SmemCopyAtomO{}, tiled_mma_pv);
@@ -414,7 +413,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
 
             if (warp_idx == NUM_WARPS - 1) {
                 cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-                int lane_predicate == cute::elect_one_sync();
+                int lane_predicate = cute::elect_one_sync();
                 if (lane_predicate) {
                     cute::copy(TMA_O, tOsO, tOgO);
                     tma_store_arrive();
