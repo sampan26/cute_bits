@@ -16,7 +16,7 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 cc_flag = []
 cc_flag.append("-gencode")
@@ -32,7 +32,7 @@ ext_modules.append(
     CUDAExtension(
         name="flash_cuda",
         sources=[
-            "flash_api.cpp",
+            "flash_api.cu",
             "flash_fwd_kernel_bf16_sm90.cu",
         ],
         extra_compile_args={
@@ -41,17 +41,17 @@ ext_modules.append(
                 [
                     "-O3",
                     "-std=c++17",
-                    "-DNDEBUG",
-                    "-D_USE_MATH_DEFINES",
-                    "-Wno-deprecated-declarations",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math",
-                    "--ptxas-options=-v,--register-usage-level=10"
+                    # "-DNDEBUG",
+                    # "-D_USE_MATH_DEFINES",
+                    # "-Wno-deprecated-declarations",
+                    # "-U__CUDA_NO_HALF_OPERATORS__",
+                    # "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    # "-U__CUDA_NO_HALF2_OPERATORS__",
+                    # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    # "--expt-relaxed-constexpr",
+                    # "--expt-extended-lambda",
+                    # "--use_fast_math",
+                    # "--ptxas-options=-v,--register-usage-level=10"
                 ]
                 + cc_flag
             ),
@@ -59,6 +59,7 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / 
             Path(this_dir) / "cutlass" / "include",
+            "/usr/local/cuda-13.0/include",  # Add this line
         ],
     )
 )
