@@ -54,61 +54,55 @@ struct AttentionKernelTraits {
                                    GMMA::Major::K, GMMA::Major::MN>(), // we use Vt which is N major
         Layout<Shape<Int<BM/64>, _1>, _1>{}));
 
-    // using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-    //                                 cute::get<0>(TileShape{}), cute::get<2>(TileShape{})>());
-    // using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-    //                                 cute::get<1>(TileShape{}), cute::get<2>(TileShape{})>());
-    // using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-    //                                 cute::get<1>(TileShape{}), cute::get<2>(TileShape{})>());
-    // using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-    //                                 cute::get<0>(TileShape{}), cute::get<2>(TileShape{})>());
-                                    
-    // using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0,2>(TileShape{})));
+    using SmemLayoutQ = decltype(tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<Element>{}, 
+        select<0,2>(TileShape{})));
 
-    // using SmemLayoutK = decltype(tile_to_shape(
-    //     SmemLayoutAtomK{}, 
-    //     make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
+    using SmemLayoutK = decltype(tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<Element>{}, 
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
 
-    // using SmemLayoutV = decltype(tile_to_shape(
-    //     SmemLayoutAtomV{}, 
-    //     make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
+    using SmemLayoutV = decltype(tile_to_shape(
+        GMMA::Layout_K_SW128_Atom<Element>{}, 
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
 
-    // using SmemLayoutVt = decltype(composition(
-    //     SmemLayoutAtomV{}, make_ordered_layout(make_shape(shape<2>(TileShape{}), shape<1>(TileShape{}), Int<NUM_STAGES>{}),
-    //                         Step<_2,_1,_3>{})));
+    using SmemLayoutVt = decltype(composition(
+        GMMA::Layout_K_SW128_Atom<Element>{}, 
+        make_ordered_layout(make_shape(shape<2>(TileShape{}), shape<1>(TileShape{}), Int<NUM_STAGES>{}),
+                            Step<_2,_1,_3>{})));
     
-    // using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0,2>(TileShape{})));
+    using SmemLayoutO = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<Element>{}, select<0,2>(TileShape{})));
 
-    // using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
+    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
-    // using MainloopPipeline = typename cutlass::PipelineTmaAsync<NUM_STAGES>;
-    // using PipelineState = typename MainloopPipeline::PipelineState<NUM_STAGES>;
+    using MainloopPipeline = typename cutlass::PipelineTmaAsync<NUM_STAGES>;
     
-    // static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
-    // static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
+    static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
+    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
 };
 
 template <typename AttentionKernelTraits, bool Is_causal, typename SharedStorage>
 __global__ void __launch_bounds__(AttentionKernelTraits::NUM_THREADS, 1 , 1) 
 flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
-    // constexpr int BM = AttentionKernelTraits::BM;
-    // constexpr int BN = AttentionKernelTraits::BN;
-    // constexpr int HEAD_DIM = AttentionKernelTraits::HEAD_DIM;
-    // constexpr int NUM_WARPS = AttentionKernelTraits::NUM_WARPS;
-    // constexpr int NUM_THREADS = AttentionKernelTraits::NUM_THREADS;
-    // constexpr int NUM_PRODUCER_THREADS = AttentionKernelTraits::NUM_PRODUCER_THREADS;
-    // constexpr int NUM_CONSUMER_THREADS = size(typename AttentionKernelTraits::TiledMmaQK{});
-    // constexpr int NUM_STAGES = AttentionKernelTraits::NUM_STAGES;
-    // using Element = typename AttentionKernelTraits::Element;
-    // using index_t = typename AttentionKernelTraits::index_t;
+    constexpr int BM = AttentionKernelTraits::BM;
+    constexpr int BN = AttentionKernelTraits::BN;
+    constexpr int HEAD_DIM = AttentionKernelTraits::HEAD_DIM;
+    constexpr int NUM_WARPS = AttentionKernelTraits::NUM_WARPS;
+    constexpr int NUM_THREADS = AttentionKernelTraits::NUM_THREADS;
+    constexpr int NUM_PRODUCER_THREADS = AttentionKernelTraits::NUM_PRODUCER_THREADS;
+    constexpr int NUM_CONSUMER_THREADS = size(typename AttentionKernelTraits::TiledMmaQK{});
+    constexpr int NUM_HEADS = params.h;
+    constexpr int NUM_STAGES = AttentionKernelTraits::NUM_STAGES;
+    using Element = typename AttentionKernelTraits::Element;
+    using index_t = typename AttentionKernelTraits::index_t;
 
-    // const int q_tile_idx = blockIdx.x;
-    // const int batch_head_idx = blockIdx.y;
-    // const int batch_idx = batch_head_idx / NUM_HEADS;
-    // const int head_idx = batch_head_idx % NUM_HEADS;
+    const int q_tile_idx = blockIdx.x;
+    const int batch_head_idx = blockIdx.y;
+    const int batch_idx = batch_head_idx / NUM_HEADS;
+    const int head_idx = batch_head_idx % NUM_HEADS;
     
-    // using TileShape = typename AttentionKernelTraits::TileShape;
-    // const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
+    using TileShape = typename AttentionKernelTraits::TileShape;
+    const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
 
     // using MainloopPipeline = typename AttentionKernelTraits::MainloopPipeline;
     // using PipelineParams = typename MainloopPipeline::Params;
