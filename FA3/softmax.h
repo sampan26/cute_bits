@@ -1,8 +1,9 @@
 #pragma once
 
+#include <cmath>
 
 #include <cute/tensor.hpp>
-#include <cutlass/detail/helper_macros.hpp>
+#include <cutlass/numeric_types.h>
 
 #include "utils.h"
 
@@ -80,7 +81,7 @@ __forceinline__ __device__ auto scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 
 template <int NUM_ROWS_PER_THREAD>
 struct Softmax {
-    using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>));
+    using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
     TensorT scores_max, scores_sum, scores_scale;
     float sm_scale_log2;
 
@@ -95,7 +96,7 @@ struct Softmax {
         Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
         if constexpr (init) {
             reduce_max<true>(scores, scores_max);
-            scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+            scale_apply_exp2(scores, scores_max, sm_scale_log2);
             reduce_sum<true, false>(scores, scores_sum);
             cute::fill(scores_scale, 1.f);
         } else {
@@ -137,8 +138,8 @@ struct Softmax {
             float sum = scores_sum(mi);
             float inv_sum = pv_scale / sum;
             scores_scale(mi) = inv_sum;
-            scores_sum(mi) = scores_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
+            scores_sum(mi) = scores_max(mi) * sm_scale_log2 + ptx_log2(sum);
         }
     };
     
-}
+};

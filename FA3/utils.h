@@ -2,12 +2,15 @@
 
 #include <cmath>
 
+
 #include <cute/tensor.hpp>
+
+#include <cutlass/array.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
-#include "utils.h"
-
-
+using namespace cute;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
@@ -30,6 +33,18 @@ __device__ __forceinline__ T operator()(T const & x, T const & y) { return x + y
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<int THREADS>
+struct Allreduce {
+    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
+    template<typename T, typename Operator>
+    static __device__ __forceinline__ T run(T x, Operator &op) {
+        constexpr int OFFSET = THREADS / 2;
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
+        return Allreduce<OFFSET>::run(x, op);
+    }
+};
+
+
 
 template<>
 struct Allreduce<2> {
@@ -41,17 +56,6 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<int THREADS>
-struct Allreduce {
-    static_assert(THREADS == 32 || THREADS == 16 || THREADS == 8 || THREADS == 4);
-    template<typename T, typename Operator>
-    static __device__ __forceinline__ T run(T x, Operator &op) {
-        constexpr int OFFSET = THREADS / 2;
-        x = op(x, __shfl_xor_sync(uint32_t(-1), x, OFFSET));
-        return Allreduce<OFFSET>::run(x, op);
-    }
-};
 
 
 
@@ -125,3 +129,31 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tenso
   auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel>*>(tensor.data()));
   return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
+
+
+__forceinline__ __device__ float ptx_log2(float x) {
+    float y;
+    asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+template<int NumMmaThreads>
+__device__ __forceinline__ void scheduler_barrier_arrive(int wg_idx) {
+    if constexpr (NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, 3 + (3 - wg_idx) /*id*/);
+    } else {
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, wg_idx <= 2 ? 3 + wg_idx + 1 : 3 + wg_idx + 1 - 3);
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, wg_idx <= 1 ? 3 + wg_idx + 2 : 3 + wg_idx + 2 - 3);
+    }
+}
+
+#define CHECK_CUDA(call)                                                                                  \
+    do {                                                                                                  \
+        cudaError_t status_ = call;                                                                       \
+        if (status_ != cudaSuccess) {                                                                     \
+            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+            exit(1);                                                                              \
+        }                                                                                                 \
+    } while(0)
+
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())

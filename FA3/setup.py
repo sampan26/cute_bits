@@ -41,25 +41,25 @@ ext_modules.append(
                 [
                     "-O3",
                     "-std=c++17",
-                    # "-DNDEBUG",
-                    # "-D_USE_MATH_DEFINES",
-                    # "-Wno-deprecated-declarations",
-                    # "-U__CUDA_NO_HALF_OPERATORS__",
-                    # "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    # "-U__CUDA_NO_HALF2_OPERATORS__",
-                    # "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    # "--expt-relaxed-constexpr",
-                    # "--expt-extended-lambda",
-                    # "--use_fast_math",
-                    # "--ptxas-options=-v,--register-usage-level=10"
+                    "-DNDEBUG",
+                    "-D_USE_MATH_DEFINES",
+                    "-Wno-deprecated-declarations",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                    "--ptxas-options=-v,--register-usage-level=10"
                 ]
                 + cc_flag
             ),
         },
         include_dirs=[
-            Path(this_dir) / 
-            Path(this_dir) / "cutlass" / "include",
-            "/usr/local/cuda-13.0/include",  # Add this line
+            str(Path(this_dir)),
+            str(Path(this_dir) / "cutlass" / "include"),
+            str(Path(this_dir) / "cutlass" / "tools" / "util" / "include"),
         ],
     )
 )

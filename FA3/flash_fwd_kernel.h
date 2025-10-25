@@ -4,33 +4,22 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
-#include "cutlass/pipeline/pipeline.hpp"
+#include <cutlass/pipeline/pipeline.hpp>
 
-#include "cute/tensor.hpp"
+#include <cute/tensor.hpp>
+
+using namespace cute;
 
 #include "flash.h"
 #include "utils.h"
 #include "softmax.h"
-#include "static_switch.h"
-
-using namespace cute;
-
-template<int NumMmaThreads>
-__device__ __forceinline__ void scheduler_barrier_arrive(int wg_idx) {
-    if constexpr (NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, 3 + (3 - wg_idx) /*id*/);
-    } else {
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, wg_idx <= 2 ? 3 + wg_idx + 1 : 3 + wg_idx + 1 - 3);
-        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, wg_idx <= 1 ? 3 + wg_idx + 2 : 3 + wg_idx + 2 - 3);
-    }
-}
 
 template<typename AttentionKernelTraits>
 struct SharedStorage {
-    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutQ>> smem_q;
-    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutK>> smem_k;
-    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutV>> smem_v;
-    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutO>> smem_o;
+    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutQ>> smem_q;
+    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutK>> smem_k;
+    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutV>> smem_v;
+    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutO>> smem_o;
     struct {
         cutlass::arch::ClusterTransactionBarrier barrier_Q;
         cutlass::arch::ClusterBarrier barrier_O;
@@ -57,7 +46,7 @@ struct AttentionKernelTraits {
     using TileShape = Shape<Int<BM>, Int<BN>, Int<HEAD_DIM>>;
 
     using TiledMmaQK = decltype(make_tiled_mma(
-        cute::GMMA::ss_op_selector<Element, Element, float, TileShape{}>(),
+        cute::GMMA::ss_op_selector<Element, Element, float, TileShape>(),
         Layout<Shape<Int<BM/64>, _1>, _1>{}));
 
     using TiledMmaPV = decltype(make_tiled_mma(
@@ -65,37 +54,38 @@ struct AttentionKernelTraits {
                                    GMMA::Major::K, GMMA::Major::MN>(), // we use Vt which is N major
         Layout<Shape<Int<BM/64>, _1>, _1>{}));
 
-    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-                                    decltype(cute::get<0>(TileShape{})), decltype(cute::get<2>(TileShape{}))>());
-    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-                                    decltype(cute::get<1>(TileShape{})), decltype(cute::get<2>(TileShape{}))>());
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-                                    decltype(cute::get<1>(TileShape{})), decltype(cute::get<2>(TileShape{}))>());
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
-                                    cute::get<0>(TileShape{}), cute::get<2>(TileShape{})>());
-    using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0,2>(TileShape{})));
+    // using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
+    //                                 cute::get<0>(TileShape{}), cute::get<2>(TileShape{})>());
+    // using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
+    //                                 cute::get<1>(TileShape{}), cute::get<2>(TileShape{})>());
+    // using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
+    //                                 cute::get<1>(TileShape{}), cute::get<2>(TileShape{})>());
+    // using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element, 
+    //                                 cute::get<0>(TileShape{}), cute::get<2>(TileShape{})>());
+                                    
+    // using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0,2>(TileShape{})));
 
-    using SmemLayoutK = decltype(tile_to_shape(
-        SmemLayoutAtomK{}, 
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
+    // using SmemLayoutK = decltype(tile_to_shape(
+    //     SmemLayoutAtomK{}, 
+    //     make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
 
-    using SmemLayoutV = decltype(tile_to_shape(
-        SmemLayoutAtomV{}, 
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
+    // using SmemLayoutV = decltype(tile_to_shape(
+    //     SmemLayoutAtomV{}, 
+    //     make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<NUM_STAGES>{})));
 
-    using SmemLayoutVt = decltype(composition(
-        SmemLayoutAtomV{}, make_ordered_layout(make_shape(shape<2>(TileShape{}), shape<1>(TileShape{}), Int<NUM_STAGES>{}),
-                            Step<_2,_1,_3>{})));
+    // using SmemLayoutVt = decltype(composition(
+    //     SmemLayoutAtomV{}, make_ordered_layout(make_shape(shape<2>(TileShape{}), shape<1>(TileShape{}), Int<NUM_STAGES>{}),
+    //                         Step<_2,_1,_3>{})));
     
-    using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0,2>(TileShape{})));
+    // using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0,2>(TileShape{})));
 
-    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
+    // using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
-    using MainloopPipeline = typename cutlass::PipelineTmaAsync<NUM_STAGES>;
-    using PipelineState = typename MainloopPipeline::PipelineState<NUM_STAGES>;
+    // using MainloopPipeline = typename cutlass::PipelineTmaAsync<NUM_STAGES>;
+    // using PipelineState = typename MainloopPipeline::PipelineState<NUM_STAGES>;
     
-    static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
-    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
+    // static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
+    // static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
 };
 
 template <typename AttentionKernelTraits, bool Is_causal, typename SharedStorage>
@@ -437,14 +427,13 @@ void run_flash_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = sizeof(SharedStorage);
     CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     kernel<<<dim3(num_q_blocks, params.h, params.b), AttentionKernelTraits::NUM_THREADS, smem_size, stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 
 template <typename T, int Headdim>
 void run_mha_fwd(Flash_fwd_params params, cudaStream_t stream) {
     static_assert(Headdim == 128);
-    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        using AttentionKernelTraits = AttentionKernelTraits<128, 128, Is_causal ? 128 : 178, Is_causal ? 2 : 1, T>;
-        run_flash_mha_fwd<AttentionKernelTraits, SharedStorage<AttentionKernelTraits>, Is_causal>(params, stream);
-    });
+    using AttentionKernelTraits = AttentionKernelTraits<128, 128, 128, 2, T>;
+    run_flash_mha_fwd<AttentionKernelTraits, SharedStorage<AttentionKernelTraits>, true>(params, stream);
 }
