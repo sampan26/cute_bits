@@ -309,7 +309,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
         pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
         cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS, 3 + warp_group_idx);
         gemm<true, -1>(tiled_mma_qk, tSrQ, tSrK(_,_,_,smem_pipe_read_k.index()),tSrS);
-        scheduler_barrier_arrive(warp_group_idx);
+        scheduler_barrier_arrive<NUM_CONSUMER_THREADS>(warp_group_idx);
         warpgroup_wait<0>();
         pipeline_k.consumer_release(smem_pipe_read_k);
         ++smem_pipe_read_k;
@@ -342,7 +342,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
 
             pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
             gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_,_,_,smem_pipe_read_v.index()),tOrO);
-            scheduler_barrier_arrive(warp_group_idx);
+            scheduler_barrier_arrive<NUM_CONSUMER_THREADS>(warp_group_idx);
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);
             {
@@ -373,7 +373,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
             softmax.rescale_o(tOrO);
             pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v));
             gemm<false, -1>(tiled_mma_pv, tOrP, tOrV(_,_,_,smem_pipe_read_v.index()),tOrO);
-            scheduler_barrier_arrive(warp_group_idx);
+            scheduler_barrier_arrive<NUM_CONSUMER_THREADS>(warp_group_idx);
             warpgroup_wait<1>();
             pipeline_k.consumer_release(smem_pipe_read_k);
             softmax.update<false>(tSrS);
