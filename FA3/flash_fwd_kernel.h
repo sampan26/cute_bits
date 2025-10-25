@@ -5,6 +5,8 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/pipeline/pipeline.hpp>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cute/arch/copy_sm90.hpp>
 
 #include <cute/tensor.hpp>
 
@@ -16,10 +18,10 @@ using namespace cute;
 
 template<typename AttentionKernelTraits>
 struct SharedStorage {
-    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutQ>> smem_q;
-    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutK>> smem_k;
-    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutV>> smem_v;
-    // cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutO>> smem_o;
+    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutQ>> smem_q;
+    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutK>> smem_k;
+    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutV>> smem_v;
+    cute::array_aligned<typename AttentionKernelTraits::Element, cute::cosize_v<typename AttentionKernelTraits::SmemLayoutO>> smem_o;
     struct {
         cutlass::arch::ClusterTransactionBarrier barrier_Q;
         cutlass::arch::ClusterBarrier barrier_O;
@@ -91,7 +93,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int NUM_THREADS = AttentionKernelTraits::NUM_THREADS;
     constexpr int NUM_PRODUCER_THREADS = AttentionKernelTraits::NUM_PRODUCER_THREADS;
     constexpr int NUM_CONSUMER_THREADS = size(typename AttentionKernelTraits::TiledMmaQK{});
-    constexpr int NUM_HEADS = params.h;
+    const int NUM_HEADS = params.h;
     constexpr int NUM_STAGES = AttentionKernelTraits::NUM_STAGES;
     using Element = typename AttentionKernelTraits::Element;
     using index_t = typename AttentionKernelTraits::index_t;
@@ -104,72 +106,76 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     using TileShape = typename AttentionKernelTraits::TileShape;
     const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
 
-    // using MainloopPipeline = typename AttentionKernelTraits::MainloopPipeline;
-    // using PipelineParams = typename MainloopPipeline::Params;
-    // using PipelineState = typename MainloopPipeline::PipelineState;
+    using SmemLayoutQ = typename AttentionKernelTraits::SmemLayoutQ;
 
-    // auto LayoutQ = make_layout(
-    //     make_shape(params.seqlen, params.d, params.h, params.b), 
-    //     make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride)
-    // );
+    using MainloopPipeline = typename AttentionKernelTraits::MainloopPipeline;
+    using PipelineParams = typename MainloopPipeline::Params;
+    using PipelineState = typename MainloopPipeline::PipelineState;
 
-    // auto LayoutK = make_layout(
-    //     make_shape(params.seqlen, params.d, params.h, params.b), 
-    //     make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride)
-    // );
-    // auto LayoutV = make_layout(
-    //     make_shape(params.seqlen, params.d, params.h, params.b), 
-    //     make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride)
-    // );
-    // auto LayoutO = make_layout(
-    //     make_shape(params.seqlen, params.d, params.h, params.b), 
-    //     make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride)
-    // );
+    auto LayoutQ = make_layout(
+        make_shape(params.seqlen, HEAD_DIM), 
+        make_stride(params.q_row_stride, _1{})
+    );
 
-    // auto TMA_Q = cute::make_tma_copy(
+    auto LayoutK = make_layout(
+        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
+        make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride)
+    );
+    auto LayoutV = make_layout(
+        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
+        make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride)
+    );
+    auto LayoutO = make_layout(
+        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
+        make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride)
+    );
+
+    extern __shared__ char shared_memory[];
+    auto &storage = *reinterpret_cast<SharedStorage*>(shared_memory);
+    
+    auto q9 = static_cast<Element>(params.q_ptr) + (batch_idx * params.q_batch_stride + head_idx * params.q_head_stride) * 2; 
+
+    auto TMA_Q = make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(make_gmem_ptr(q9), LayoutQ),
+        SmemLayoutQ{},
+        make_shape(Int<BM>{}, Int<HEAD_DIM>{}),
+        _1{}
+    )
+
+    // auto TMA_K = make_tma_copy(
     //     SM90_TMA_LOAD{},
-    //     make_tensor(make_gmem_ptr(params.q_ptr), LayoutQ),
-    //     AttentionKernelTraits::SmemLayoutQ{},
-    //     make_shape(Int<bM>{}, Int<HEAD_DIM>{}),
-    //     _1{}
-    // );
-
-    // auto TMA_K = cute::make_tma_copy(
-    //     SM90_TMA_LOAD{},
-    //     make_tensor(make_gmem_ptr(params.k_ptr), LayoutK),
-    //     AttentionKernelTraits::SmemLayoutK{}(_,_,_0),
-    //     make_shape(Int<BN>{}, Int<HEAD_DIM>{}),
+    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.k_ptr)), LayoutK),
+    //     typename AttentionKernelTraits::SmemLayoutK{}(_,_,_0{}),
+    //     select<1,2>(TileShape{}),
     //     _1{}
     // );
 
     // auto TMA_V = cute::make_tma_copy(
     //     SM90_TMA_LOAD{},
-    //     make_tensor(make_gmem_ptr(params.v_ptr), LayoutV),
-    //     AttentionKernelTraits::SmemLayoutV{}(_,_,_0),
-    //     make_shape(Int<BN>{}, Int<HEAD_DIM>{}),
+    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.v_ptr)), LayoutV),
+    //     AttentionKernelTraits::SmemLayoutV{}(_,_,_0{}),
+    //     select<1,2>(TileShape{}),
     //     _1{}
     // );
 
     // auto TMA_O = cute::make_tma_copy(
     //     SM90_TMA_STORE{},
-    //     make_tensor(make_gmem_ptr(params.o_ptr), LayoutO),
+    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.o_ptr)), LayoutO),
     //     AttentionKernelTraits::SmemLayoutO{},
-    //     make_shape(Int<BM>{}, Int<HEAD_DIM>{}),
+    //     select<0,1>(TileShape{}),
     //     _1{}
     // );
 
-    // extern __shared__ char shared_memory[];
-    // auto &storage = *reinterpret_cast<SharedStorage*>(shared_memory);
 
-    // Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), typename AttentionKernelTraits::SmemLayoutQ{});
-    // Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), typename AttentionKernelTraits::SmemLayoutK{});
-    // Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), typename AttentionKernelTraits::SmemLayoutV{});
-    // Tensor sVt = make_tensor(make_smem_ptr(storage.smem_v.data()), typename AttentionKernelTraits::SmemLayoutVt{});
-    // Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), typename AttentionKernelTraits::SmemLayoutO{});
+    Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), typename AttentionKernelTraits::SmemLayoutQ{});
+    Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), typename AttentionKernelTraits::SmemLayoutK{});
+    Tensor sVt = make_tensor(make_smem_ptr(storage.smem_v.data()), typename AttentionKernelTraits::SmemLayoutVt{});
+    Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), typename AttentionKernelTraits::SmemLayoutO{});
 
-    // const int lane_predicate = cute::elect_one();
-    // const int warp_idx = cutlass::canonical_warp_idx_sync();
-    // int warp_group_idx = cutlass::canonical_warp_group_idx();
+    int lane_predicate = cute::elect_one_sync();
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+    const int warp_group_idx = cutlass::canonical_warp_group_idx();
 
     // if (warp_idx == 0 && lane_predicate) {
     //     prefetch_tma_descriptor(TMA_Q.get_tma_descriptor());
@@ -178,28 +184,28 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     //     prefetch_tma_descriptor(TMA_O.get_tma_descriptor());
     // }
 
-    // PipelineParams params;
-    // params.is_leader = threadIdx.x % 128 == 0;
-    // params.num_consumers = NUM_CONSUMER_THREADS;
-    // params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
-    // params.transaction_bytes = AttentionKernelTraits::TmaTransactionBytesK;
+    PipelineParams pipe_params;
+    pipe_params.is_leader = threadIdx.x % 128 == 0;
+    pipe_params.num_consumers = NUM_CONSUMER_THREADS;
+    pipe_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer : MainloopPipeline::ThreadCategory::Consumer;
+    pipe_params.transaction_bytes = AttentionKernelTraits::TmaTransactionBytesK;
 
-    // if (warp_idx == 0 && lane_predicate) {
-    //     storage.barrier_Q.init(1);
-    //     storage.barrier_O.init(1);
-    // }
+    if (warp_idx == 0 && lane_predicate) {
+        storage.barrier_Q.init(1);
+        storage.barrier_O.init(1);
+    }
 
-    // MainloopPipeline pipeline_k(storage.pipeline_k, params, Shape<_1, _1, _1>{});
-    // MainloopPipeline pipeline_v(storage.pipeline_v, params, Shape<_1, _1, _1>{});
+    MainloopPipeline pipeline_k(storage.pipeline_k, pipe_params, Shape<_1, _1, _1>{});
+    MainloopPipeline pipeline_v(storage.pipeline_v, pipe_params, Shape<_1, _1, _1>{});
 
-    // __syncthreads();
+    __syncthreads();
 
-    // if (warp_group_idx == 0) {
-    //     cutlass::arch::warpgroup_reg_dealloc<24>();
-    //     int warp_idx_in_wg = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
-    //     if (warp_idx_in_wg == 0) {
-    //         PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-    //         PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+    if (warp_group_idx == 0) {
+        cutlass::arch::warpgroup_reg_dealloc<24>();
+        int warp_idx_in_wg = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+        if (warp_idx_in_wg == 0) {
+            PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
+            PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
     //         Tensor mQ = TMA_Q.get_tma_tensor(LayoutQ.shape());
     //         Tensor mK = TMA_K.get_tma_tensor(LayoutK.shape());
@@ -258,8 +264,9 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     //     if (lane_predicate) {
     //         pipeline_k.producer_tail(smem_pipe_write_k);
     //         pipeline_v.producer_tail(smem_pipe_write_v);
-    //     }
-    // } else {
+        }
+    } 
+    // else {
     //     cutlass::arch::warpgroup_reg_alloc<240>();
     //     const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
     //     PipelineState smem_pipe_read_k, smem_pipe_read_v;
