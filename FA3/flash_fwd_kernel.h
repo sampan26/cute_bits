@@ -31,7 +31,7 @@ struct SharedStorage {
 };
 
 
-template <int HEAD_DIM_, int BM_, int BN_, int NUM_STAGES_, typename T>
+template <int HEAD_DIM_, int BM_, int BN_, int NUM_STAGES_, class LayoutQ_, class LayoutK_, class LayoutV_, class LayoutO_, typename T>
 struct AttentionKernelTraits {
     using Element = T;
     using index_t = int64_t;
@@ -44,6 +44,11 @@ struct AttentionKernelTraits {
     static constexpr int NUM_THREADS = NUM_WARPS * 32;
     static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
     static constexpr int NUM_STAGES = NUM_STAGES_;
+
+    using LayoutQ = LayoutQ_;
+    using LayoutK = LayoutK_;
+    using LayoutV = LayoutV_;
+    using LayoutO = LayoutO_;
 
     using TileShape = Shape<Int<BM>, Int<BN>, Int<HEAD_DIM>>;
 
@@ -106,67 +111,12 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     using TileShape = typename AttentionKernelTraits::TileShape;
     const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
 
-    using SmemLayoutQ = typename AttentionKernelTraits::SmemLayoutQ;
-
     using MainloopPipeline = typename AttentionKernelTraits::MainloopPipeline;
     using PipelineParams = typename MainloopPipeline::Params;
     using PipelineState = typename MainloopPipeline::PipelineState;
 
-    auto LayoutQ = make_layout(
-        make_shape(params.seqlen, HEAD_DIM), 
-        make_stride(params.q_row_stride, _1{})
-    );
-
-    auto LayoutK = make_layout(
-        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
-        make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride)
-    );
-    auto LayoutV = make_layout(
-        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
-        make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride)
-    );
-    auto LayoutO = make_layout(
-        make_shape(params.seqlen, HEAD_DIM, params.h, params.b), 
-        make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride)
-    );
-
     extern __shared__ char shared_memory[];
     auto &storage = *reinterpret_cast<SharedStorage*>(shared_memory);
-    
-    auto q9 = static_cast<Element>(params.q_ptr) + (batch_idx * params.q_batch_stride + head_idx * params.q_head_stride) * 2; 
-
-    auto TMA_Q = make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(make_gmem_ptr(q9), LayoutQ),
-        SmemLayoutQ{},
-        make_shape(Int<BM>{}, Int<HEAD_DIM>{}),
-        _1{}
-    )
-
-    // auto TMA_K = make_tma_copy(
-    //     SM90_TMA_LOAD{},
-    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.k_ptr)), LayoutK),
-    //     typename AttentionKernelTraits::SmemLayoutK{}(_,_,_0{}),
-    //     select<1,2>(TileShape{}),
-    //     _1{}
-    // );
-
-    // auto TMA_V = cute::make_tma_copy(
-    //     SM90_TMA_LOAD{},
-    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.v_ptr)), LayoutV),
-    //     AttentionKernelTraits::SmemLayoutV{}(_,_,_0{}),
-    //     select<1,2>(TileShape{}),
-    //     _1{}
-    // );
-
-    // auto TMA_O = cute::make_tma_copy(
-    //     SM90_TMA_STORE{},
-    //     make_tensor(make_gmem_ptr(static_cast<Element const*>(params.o_ptr)), LayoutO),
-    //     AttentionKernelTraits::SmemLayoutO{},
-    //     select<0,1>(TileShape{}),
-    //     _1{}
-    // );
-
 
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), typename AttentionKernelTraits::SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), typename AttentionKernelTraits::SmemLayoutK{});
@@ -435,6 +385,28 @@ void run_flash_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 template <typename T, int Headdim>
 void run_mha_fwd(Flash_fwd_params params, cudaStream_t stream) {
     static_assert(Headdim == 128);
-    using AttentionKernelTraits = AttentionKernelTraits<128, 128, 128, 2, T>;
+    
+    using LayoutQ = decltype(make_layout(
+        make_shape(params.seqlen, Headdim, params.h, params.b), 
+        make_stride(params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride)
+    ));
+
+    using LayoutK = decltype(make_layout(
+        make_shape(params.seqlen, Headdim, params.h, params.b), 
+        make_stride(params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride)
+    ));
+    using LayoutV = decltype(make_layout(
+        make_shape(params.seqlen, Headdim, params.h, params.b), 
+        make_stride(params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride)
+    ));
+    using LayoutO = decltype(make_layout(
+        make_shape(params.seqlen, Headdim, params.h, params.b), 
+        make_stride(params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride)
+    ));
+
+    
+    using mQ = decltype(make_tensor(static_cast<T*>(params.q_ptr), LayoutQ{}));
+
+    using AttentionKernelTraits = AttentionKernelTraits<128, 128, 128, 2, LayoutQ, LayoutK, LayoutV, LayoutO, T>;
     run_flash_mha_fwd<AttentionKernelTraits, SharedStorage<AttentionKernelTraits>, true>(params, stream);
 }
