@@ -31,7 +31,7 @@ struct SharedStorage {
 };
 
 
-template <int HEAD_DIM_, int BM_, int BN_, int NUM_STAGES_, class LayoutQ_, class LayoutK_, class LayoutV_, class LayoutO_, typename T>
+template <int HEAD_DIM_, int BM_, int BN_, int NUM_STAGES_, class LayoutQ_, class LayoutK_, class LayoutV_, class LayoutO_, class mQ, class mK, class mV, class mO, typename T>
 struct AttentionKernelTraits {
     using Element = T;
     using index_t = int64_t;
@@ -83,6 +83,30 @@ struct AttentionKernelTraits {
     using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<NUM_STAGES>;
+
+    using TMA_Q = decltype(make_tma_copy(
+        SM90_TMA_LOAD{},
+        mQ{},
+        SmemLayoutQ{},
+        select<0,2>(TileShape{}),
+        _1{}
+    ));
+
+    using TMA_K = decltype(make_tma_copy(
+        SM90_TMA_LOAD{},
+        mK{},
+        take<0,2>(SmemLayoutK{}),
+        select<1,2>(TileShape{}),
+        _1{}
+    ));
+
+    using TMA_V = decltype(make_tma_copy(
+        SM90_TMA_LOAD{},
+        mV{},
+        take<0,2>(SmemLayoutV{}),
+        select<1,2>(TileShape{}),
+        _1{}
+    ));
     
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<Element> / 8);
@@ -98,6 +122,8 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     constexpr int NUM_THREADS = AttentionKernelTraits::NUM_THREADS;
     constexpr int NUM_PRODUCER_THREADS = AttentionKernelTraits::NUM_PRODUCER_THREADS;
     constexpr int NUM_CONSUMER_THREADS = size(typename AttentionKernelTraits::TiledMmaQK{});
+    static constexpr uint32_t TmaTransactionBytesQ = AttentionKernelTraits::TmaTransactionBytesQ;
+    static constexpr uint32_t TmaTransactionBytesK = AttentionKernelTraits::TmaTransactionBytesK;
     const int NUM_HEADS = params.h;
     constexpr int NUM_STAGES = AttentionKernelTraits::NUM_STAGES;
     using Element = typename AttentionKernelTraits::Element;
@@ -110,6 +136,11 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     
     using TileShape = typename AttentionKernelTraits::TileShape;
     const int num_kv_tiles = cute::ceil_div((q_tile_idx + 1) * get<0>(TileShape{}), get<1>(TileShape{}));
+
+    auto tma_load_q = typename AttentionKernelTraits::TMA_Q{};
+    auto tma_load_k = typename AttentionKernelTraits::TMA_K{};
+    auto tma_load_v = typename AttentionKernelTraits::TMA_V{};
+
 
     using MainloopPipeline = typename AttentionKernelTraits::MainloopPipeline;
     using PipelineParams = typename MainloopPipeline::Params;
@@ -127,12 +158,12 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int warp_group_idx = cutlass::canonical_warp_group_idx();
 
-    // if (warp_idx == 0 && lane_predicate) {
-    //     prefetch_tma_descriptor(TMA_Q.get_tma_descriptor());
-    //     prefetch_tma_descriptor(TMA_K.get_tma_descriptor());
-    //     prefetch_tma_descriptor(TMA_V.get_tma_descriptor());
-    //     prefetch_tma_descriptor(TMA_O.get_tma_descriptor());
-    // }
+    if (warp_idx == 0 && lane_predicate) {
+        prefetch_tma_descriptor(tma_load_q.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_load_k.get_tma_descriptor());
+        prefetch_tma_descriptor(tma_load_v.get_tma_descriptor());
+        // prefetch_tma_descriptor(TMA_O.get_tma_descriptor());
+    }
 
     PipelineParams pipe_params;
     pipe_params.is_leader = threadIdx.x % 128 == 0;
@@ -153,103 +184,103 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     if (warp_group_idx == 0) {
         cutlass::arch::warpgroup_reg_dealloc<24>();
         int warp_idx_in_wg = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+
+        PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
+        PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
         if (warp_idx_in_wg == 0) {
-            PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-            PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+            Tensor mQ = tma_load_q.get_tma_tensor(typename AttentionKernelTraits::LayoutQ{}.shape());
+            Tensor mK = tma_load_k.get_tma_tensor(typename AttentionKernelTraits::LayoutK{}.shape());
+            Tensor mV = tma_load_v.get_tma_tensor(typename AttentionKernelTraits::LayoutV{}.shape());
 
-    //         Tensor mQ = TMA_Q.get_tma_tensor(LayoutQ.shape());
-    //         Tensor mK = TMA_K.get_tma_tensor(LayoutK.shape());
-    //         Tensor mV = TMA_V.get_tma_tensor(LayoutV.shape());
-
-    //         Tensor gQ = local_tile(mQ(_, _, head_idx, batch_idx), select<0, 2>(TileShape{}), make_coord(q_tile_idx, _0{}));
-    //         Tensor gK = local_tile(mK(_, _, head_idx, batch_idx), select<1, 2>(TileShape{}), make_coord(_, _0{}));
-    //         Tensor gV = local_tile(mV(_, _, head_idx, batch_idx), select<2, 2>(TileShape{}), make_coord(_, _0{}));
+            Tensor gQ = local_tile(mQ(_, _, head_idx, batch_idx), select<0, 2>(TileShape{}), make_coord(q_tile_idx, _0{}));
+            Tensor gK = local_tile(mK(_, _, head_idx, batch_idx), select<1, 2>(TileShape{}), make_coord(_, _0{}));
+            Tensor gV = local_tile(mV(_, _, head_idx, batch_idx), select<2, 2>(TileShape{}), make_coord(_, _0{}));
             
-    //         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
-    //         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
+            Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
+            Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
 
-    //         auto [tQgQ, tQsQ] = tma_partition(TMA_Q, _0{}, Layout<_1>{}, group_modes<0,2>(sQ_x), group_modes<0,2>(gQ_x));
-    //         auto [tKgK, tKsK] = tma_partition(TMA_K, _0{}, Layout<_1>{}, group_modes<0,2>(sK), group_modes<0,2>(gK));
-    //         auto [tVgV, tVsV] = tma_partition(TMA_V, _0{}, Layout<_1>{}, group_modes<0,2>(sV), group_modes<0,2>(gV));
+            auto [tQgQ, tQsQ] = tma_partition(tma_load_q, _0{}, Layout<_1>{}, group_modes<0,2>(sQ_x), group_modes<0,2>(gQ_x));
+            auto [tKgK, tKsK] = tma_partition(tma_load_k, _0{}, Layout<_1>{}, group_modes<0,2>(sK), group_modes<0,2>(gK));
+            auto [tVgV, tVsV] = tma_partition(tma_load_v, _0{}, Layout<_1>{}, group_modes<0,2>(sVt), group_modes<0,2>(gV));
             
-    //         int kv_tile_idx = num_kv_tiles - 1;
-    //         int lane_predicate = cute::elect_one_sync();
-    //         if (lane_predicate) {
-    //             pipeline_k.producer_acquire(smem_pipe_write_k);
-    //             copy(TMA_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
-    //                 tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
-    //             ++smem_pipe_write_k;
-    //         }
+            int kv_tile_idx = num_kv_tiles - 1;
+            int lane_predicate = cute::elect_one_sync();
+            if (lane_predicate) {
+                pipeline_k.producer_acquire(smem_pipe_write_k);
+                copy(tma_load_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
+                    tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
+                ++smem_pipe_write_k;
+            }
 
-    //         cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
-    //         if (lane_predicate) {
-    //             storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
-    //             copy(TMA_Q.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-    //                 storage.barrier_Q), 0),
-    //                 tQgQ, tQsQ);
-    //         }
+            cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
+            if (lane_predicate) {
+                storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+                copy(tma_load_k.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                    storage.barrier_Q), 0),
+                    tQgQ, tQsQ);
+            }
 
-    //         if (lane_predicate) {
-    //             #pragma unroll 2
-    //             for (; kv_tile_idx > 0; --kv_tile_idx) {
-    //                 pipeline_k.producer_acquire(smem_pipe_write_k);
-    //                 copy(TMA_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
-    //                      tKgK(_, kv_tile_idx-1), tKsK(_, smem_pipe_write_k.index()));
-    //                 ++smem_pipe_write_k;
-    //                 pipeline_v.producer_acquire(smem_pipe_write_v);
-    //                 copy(TMA_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
-    //                      tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-    //                 ++smem_pipe_write_v;
-    //             }
-    //         }
+            if (lane_predicate) {
+                #pragma unroll 2
+                for (; kv_tile_idx > 0; --kv_tile_idx) {
+                    pipeline_k.producer_acquire(smem_pipe_write_k);
+                    copy(tma_load_k.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k), 0), 
+                         tKgK(_, kv_tile_idx-1), tKsK(_, smem_pipe_write_k.index()));
+                    ++smem_pipe_write_k;
+                    pipeline_v.producer_acquire(smem_pipe_write_v);
+                    copy(tma_load_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
+                         tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+                    ++smem_pipe_write_v;
+                }
+            }
 
-    //         if (lane_predicate) {
-    //             pipeline_v.producer_acquire(smem_pipe_write_v);
-    //                 copy(TMA_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
-    //                      tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-    //                 ++smem_pipe_write_v;
-    //         }
-    //     }
-    //     int lane_predicate = cute::elect_one_sync();
-    //     if (lane_predicate) {
-    //         pipeline_k.producer_tail(smem_pipe_write_k);
-    //         pipeline_v.producer_tail(smem_pipe_write_v);
+            if (lane_predicate) {
+                pipeline_v.producer_acquire(smem_pipe_write_v);
+                    copy(tma_load_v.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), 0), 
+                         tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+                    ++smem_pipe_write_v;
+            }
+        }
+        int lane_predicate = cute::elect_one_sync();
+        if (lane_predicate) {
+            pipeline_k.producer_tail(smem_pipe_write_k);
+            pipeline_v.producer_tail(smem_pipe_write_v);
         }
     } 
-    // else {
-    //     cutlass::arch::warpgroup_reg_alloc<240>();
-    //     const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
-    //     PipelineState smem_pipe_read_k, smem_pipe_read_v;
+    else {
+        cutlass::arch::warpgroup_reg_alloc<240>();
+        const int tid = threadIdx.x - cutlass::NumThreadsPerWarpGroup;
+        PipelineState smem_pipe_read_k, smem_pipe_read_v;
         
-    //     cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
-    //     if (warp_group_idx > 1) {
-    //         cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS, 3 + 1);
-    //     }
-    //     if constexpr (NUM_CONSUMER_THREADS == 3 * 128) {
-    //         if (warp_group_idx > 2) {
-    //             cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS, 3 + 2);
-    //         }
-    //     }
+        cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS + cutlass::NumThreadsPerWarp, 1);
+        if (warp_group_idx > 1) {
+            cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS, 3 + 1);
+        }
+        if constexpr (NUM_CONSUMER_THREADS == 3 * 128) {
+            if (warp_group_idx > 2) {
+                cutlass::arch::NamedBarrier::arrive(NUM_CONSUMER_THREADS, 3 + 2);
+            }
+        }
 
-    //     Softmax<2 * (2 * BM / NUM_CONSUMER_THREADS)>(params.softmax_scale_log2) softmax;
+        Softmax<2 * (2 * BM / NUM_CONSUMER_THREADS)> softmax(params.scale_softmax_log2);
         
-    //     typename AttentionKernelTraits::TiledMmaQK tiled_mma_qk;
-    //     typename AttentionKernelTraits::TiledMmaPV tiled_mma_pv;
-    //     auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
-    //     auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
+        typename AttentionKernelTraits::TiledMmaQK tiled_mma_qk;
+        typename AttentionKernelTraits::TiledMmaPV tiled_mma_pv;
+        auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tid);
+        auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tid);
 
-    //     Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
-    //     Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
-    //     Tensor tOrV = thr_mma_pv.partition_fragment_B(sVt);
-    //     Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(TileShape{}));
-    //     Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0,2>(TileShape{}));
+        Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
+        Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
+        Tensor tOrV = thr_mma_pv.partition_fragment_B(sVt);
+        Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0,1>(TileShape{}));
+        Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0,2>(TileShape{}));
         
-    //     tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
-    //     int kv_tile_idx = num_kv_tiles - 1; 
-    //     cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(storage.barrier_Q.try_wait(0));
-    //     if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-    //         storage.barrier_Q.wait(0);
-    //     }
+        tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
+        int kv_tile_idx = num_kv_tiles - 1; 
+        cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(storage.barrier_Q.try_wait(0));
+        if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+            storage.barrier_Q.wait(0);
+        }
 
     //     pipeline_k.consumer_wait(smem_pipe_read_k, pipeline_k.consumer_try_wait(smem_pipe_read_k));
     //     cutlass::arch::NamedBarrier::sync(NUM_CONSUMER_THREADS, 3 + warp_group_idx);
@@ -366,7 +397,7 @@ flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
     //         }
     //     }
     //     tma_store_wait<0>();
-    // }
+    }
 }
 
 
@@ -406,7 +437,14 @@ void run_mha_fwd(Flash_fwd_params params, cudaStream_t stream) {
 
     
     using mQ = decltype(make_tensor(static_cast<T*>(params.q_ptr), LayoutQ{}));
+    using mK = decltype(make_tensor(static_cast<T*>(params.k_ptr), LayoutK{}));
+    using mV = decltype(make_tensor(static_cast<T*>(params.v_ptr), LayoutV{}));
+    using mO = decltype(make_tensor(static_cast<T*>(params.o_ptr), LayoutO{}));
 
-    using AttentionKernelTraits = AttentionKernelTraits<128, 128, 128, 2, LayoutQ, LayoutK, LayoutV, LayoutO, T>;
+    using AttentionKernelTraits = AttentionKernelTraits<
+        128, 128, 128, 2, 
+        LayoutQ, LayoutK, LayoutV, LayoutO, 
+        mQ, mK, mV, mO, T>;
+
     run_flash_mha_fwd<AttentionKernelTraits, SharedStorage<AttentionKernelTraits>, true>(params, stream);
 }
