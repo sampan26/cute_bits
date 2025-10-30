@@ -97,7 +97,7 @@ struct Softmax {
         if constexpr (init) {
             reduce_max<true>(scores, scores_max);
             scale_apply_exp2(scores, scores_max, sm_scale_log2);
-            reduce_sum<true, false>(scores, scores_sum);
+            reduce_sum<true>(scores, scores_sum);
             cute::fill(scores_scale, 1.f);
         } else {
             Tensor scores_max_prev = make_fragment_like(scores_max);
@@ -110,6 +110,7 @@ struct Softmax {
                 scores_sum(mi) *= scores_scale(mi);
             }
             scale_apply_exp2(scores, scores_max, sm_scale_log2);
+            reduce_sum<false>(scores, scores_sum);;
         }
     };
     template <typename Tensor1>
