@@ -264,7 +264,7 @@ void gemm_tn(int m, int n, int k,
     auto bN = Int<128>{};
     auto bK = Int<64>{};
     auto cta_tiler = make_shape(bM, bN, bK);
-    auto     = Int<3>{};
+    auto bP  = Int<3>{};
     auto cluster_M = Int<2>{};
 
     int num_blocks_m = M / bM;
